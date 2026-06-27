@@ -1,8 +1,5 @@
 #25/05-2026
 
-#Copied from script no. 1.6.1. 
-#Adapted for 1.6.2. 
-
 #Function for loading PTM output data (N-linked glycosylation information): 
 import pandas as pd
 from pathlib import Path

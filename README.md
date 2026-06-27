@@ -3,7 +3,7 @@ This repository contains the bioinformatic pipeline, data processing scripts, an
 The scripts were designed to perform the analysis and plotting for the immunoprecipitation experiments targeting GALD-associated antigens.<br>
 <br>
 **Data Access and Functionality**<br>
-**Restricted Data**: The raw proteomic datasets utilized in this analysis are private and contain sensitive clinical information; therefore, they are not included in this repository.<br>
+**Restricted Data**: The raw proteomic datasets utilized in this analysis contain sensitive clinical information; therefore, they are not included in this repository.<br>
 <br>
 **Dependencies**: Consequently, these scripts are not functional without the original, proprietary data. The repository is intended to provide transparency regarding the methodology, statistical approach, and analytical workflow utilized in the thesis.<br>
 <br>

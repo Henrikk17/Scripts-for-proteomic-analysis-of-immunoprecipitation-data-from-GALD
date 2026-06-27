@@ -26,7 +26,7 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
 
     print(f"Loaded annotations: Found {len(sample_to_group)} total samples.")
 
-    root_path = Path(ROOT) #The ROOT must be the 'txt' folder! 
+    root_path = Path(ROOT) #The ROOT must be the FragPipe output folder! 
     prot_file = root_path / "combined_protein.tsv"
     pep_file = root_path / "combined_peptide.tsv"
 
@@ -146,6 +146,8 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
     # 4. GENERATE SHORT PROTEIN IDs
     # ==========================================
     print("\nGenerating 'Protein_short' IDs...")
+
+    #sp|P50914|RL14_HUMAN --> P50914
 
     master_prot_df['Protein_short'] = master_prot_df['Protein'].apply(
         lambda x: str(x).split('|')[1] if pd.notna(x) and '|' in str(x) else x

@@ -176,11 +176,13 @@ print("Loading cached datasets...")
 datasets = get_all_fragpipe_datasets(use_cache=True, load_peptides=False)
 
 cp_tracker = []
-# Dictionary to store sets of significant genes for overlap analysis
+
+# Dictionary to track frequency of significant genes
+# Structure: workflow -> "Up"/"Down" -> gene -> count
 workflow_overlaps = {
-    "Glyco-N": {"Up": [], "Down": []},
-    "LFQ-Comparable": {"Up": [], "Down": []},
-    "LFQ-IM-MS": {"Up": [], "Down": []}
+    "Glyco-N": {"Up": {}, "Down": {}},
+    "LFQ-Comparable": {"Up": {}, "Down": {}},
+    "LFQ-IM-MS": {"Up": {}, "Down": {}}
 }
 
 pdf_path = "../plots/All_Volcano_Plots.pdf"
@@ -191,27 +193,28 @@ with PdfPages(pdf_path) as pdf:
         label = data["label"]
         prot_df = data["prot"]
         comparisons = data["comparisons"]
-
-        # Extract workflow root name (e.g., "Glyco-N" from "Glyco-N | Run 4")
+        
         wf_name = label.split(" | ")[0]
 
         for group_case, group_ctrl in comparisons:
             print(f"[*] Processing {label}: {group_case} vs {group_ctrl}...")
             cp_result, sig_up_set, sig_down_set = generate_volcano_plot(
-                df=prot_df,
-                group_case=group_case,
-                group_ctrl=group_ctrl,
+                df=prot_df, 
+                group_case=group_case, 
+                group_ctrl=group_ctrl, 
                 dataset_name=label,
                 pdf_obj=pdf
             )
-
+            
             if cp_result:
                 cp_tracker.append(cp_result)
-                # Only track overlaps for the main comparison (GALD vs Healthy donor)
-                # to keep the intersection logical across all runs.
-                if group_ctrl == 'Healthy donor':
-                    workflow_overlaps[wf_name]["Up"].append(sig_up_set)
-                    workflow_overlaps[wf_name]["Down"].append(sig_down_set)
+                
+                # Exclude the redundant "With LB" datasets from the overlap counting
+                if "With LB" not in label:
+                    for gene in sig_up_set:
+                        workflow_overlaps[wf_name]["Up"][gene] = workflow_overlaps[wf_name]["Up"].get(gene, 0) + 1
+                    for gene in sig_down_set:
+                        workflow_overlaps[wf_name]["Down"][gene] = workflow_overlaps[wf_name]["Down"].get(gene, 0) + 1
 
 # --- Print CP Significance Summary ---
 print("\n" + "="*80)
@@ -225,27 +228,25 @@ print(cp_summary_df.to_string(index=False))
 
 # --- Print Overlap Analysis ---
 print("\n" + "="*80)
-print(" OVERLAPPING SIGNIFICANT PROTEINS (GALD vs Healthy donor) ACROSS ALL RUNS")
+print(" ROBUST SIGNIFICANT PROTEINS (>= 3 of 4 Biological Subsets)")
+print(" Subsets: Run 4 (vs Healthy), Run 5 (vs Spouse), Run 6 (vs Healthy), Run 6 (vs Spouse)")
 print("="*80)
 
-for wf_name, sets in workflow_overlaps.items():
+for wf_name, directions in workflow_overlaps.items():
     print(f"\n--- {wf_name} ---")
-
-    # Check if we successfully collected sets for this workflow
-    if not sets["Up"]:
-        print("  No 'Healthy donor' comparisons available to intersect.")
-        continue
-
-    # Calculate intersection across all runs within the workflow
-    overlap_up = set.intersection(*sets["Up"])
-    overlap_down = set.intersection(*sets["Down"])
-
-    print(f"  Up in GALD across ALL {len(sets['Up'])} runs ({len(overlap_up)} proteins):")
-    print(f"    {', '.join(sorted(overlap_up)) if overlap_up else 'None'}")
-
-    print(f"  Down in GALD across ALL {len(sets['Down'])} runs ({len(overlap_down)} proteins):")
-    print(f"    {', '.join(sorted(overlap_down)) if overlap_down else 'None'}")
+    
+    for direction in ["Up", "Down"]:
+        # Filter for genes that appear in at least 3 out of the 4 subsets
+        robust_genes = {gene: count for gene, count in directions[direction].items() if count >= 3}
+        
+        print(f"  {direction} in GALD:")
+        if robust_genes:
+            # Sort by count (descending), then alphabetically by gene name
+            sorted_genes = sorted(robust_genes.items(), key=lambda x: (-x[1], x[0]))
+            for gene, count in sorted_genes:
+                print(f"    - {gene:<10} (Significant in {count}/4 subsets)")
+        else:
+            print("    None")
 
 print("\n" + "="*80)
 print(f"✅ All plots successfully saved to: {pdf_path}")
-

@@ -1,6 +1,8 @@
 # 09/11-2026
 # Automated Volcano Plot Analysis with Multi-page PDF & CP Tracking
 
+#Use 'okular ../plots/All_Volcano_Plots.pdf' to visualize the PDF
+
 import os
 import matplotlib
 if os.environ.get('DISPLAY', '') == '':

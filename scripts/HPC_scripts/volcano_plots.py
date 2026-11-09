@@ -25,8 +25,11 @@ os.makedirs("../plots", exist_ok=True)
 
 def generate_volcano_plot(df, group_case, group_ctrl, dataset_name, pdf_obj):
     """
-    Generates a volcano plot, saves it to a multi-page PDF, 
-    and returns a dictionary tracking Ceruloplasmin (CP) significance.
+    Generates a volcano plot, saves it to a multi-page PDF.
+    Returns:
+        cp_info (dict): Tracking info for Ceruloplasmin.
+        sig_up_genes (set): Set of significantly upregulated genes.
+        sig_down_genes (set): Set of significantly downregulated genes.
     """
     # Auto-detect the correct intensity column
     if 'Razor Intensity' in df.columns:
@@ -37,20 +40,20 @@ def generate_volcano_plot(df, group_case, group_ctrl, dataset_name, pdf_obj):
         quant_col = 'Intensity'
     else:
         print(f"  [-] Could not find an intensity column in {dataset_name}. Skipping.")
-        return None
+        return None, set(), set()
 
     # Ensure the Gene column exists and drop unmapped proteins
     if 'Gene' not in df.columns:
         print(f"  [-] Missing 'Gene' column in {dataset_name}. Skipping.")
-        return None
-        
+        return None, set(), set()
+
     df_clean = df.dropna(subset=['Gene'])
     wide_df = df_clean.pivot_table(index='Gene', columns='Sample', values=quant_col, aggfunc='sum')
-    
+
     # Replace 0 with NaN first to avoid -inf in log2
     wide_df.replace(0, np.nan, inplace=True)
     log2_df = np.log2(wide_df)
-    
+
     # Perseus-style Imputation for Missing Values
     imputed_df = log2_df.copy()
     for col in imputed_df.columns:
@@ -58,11 +61,11 @@ def generate_volcano_plot(df, group_case, group_ctrl, dataset_name, pdf_obj):
         if len(valid_values) > 2:
             mean_val = valid_values.mean()
             std_val = valid_values.std()
-            
+
             # Generate random values from down-shifted distribution
             null_count = imputed_df[col].isna().sum()
-            imputed_values = np.random.normal(loc=mean_val - (1.8 * std_val), 
-                                              scale=std_val * 0.3, 
+            imputed_values = np.random.normal(loc=mean_val - (1.8 * std_val),
+                                              scale=std_val * 0.3,
                                               size=null_count)
             imputed_df.loc[imputed_df[col].isna(), col] = imputed_values
 
@@ -73,7 +76,7 @@ def generate_volcano_plot(df, group_case, group_ctrl, dataset_name, pdf_obj):
 
     if not case_samples or not ctrl_samples:
         print(f"  [-] Missing samples for {group_case} or {group_ctrl}. Skipping plot.")
-        return None
+        return None, set(), set()
 
     imputed_df = imputed_df[case_samples + ctrl_samples].dropna()
 
@@ -82,31 +85,36 @@ def generate_volcano_plot(df, group_case, group_ctrl, dataset_name, pdf_obj):
     for gene, row in imputed_df.iterrows():
         case_vals = row[case_samples].values
         ctrl_vals = row[ctrl_samples].values
-        
+
         log2fc = case_vals.mean() - ctrl_vals.mean()
         t_stat, p_val = ttest_ind(case_vals, ctrl_vals, equal_var=False)
         results.append({'Gene': gene, 'Log2FC': log2fc, 'p_value': p_val})
 
     res_df = pd.DataFrame(results).dropna()
-    
+
     if res_df.empty:
         print(f"  [-] No valid statistics calculated. Skipping plot.")
-        return None
-    
+        return None, set(), set()
+
     # Multiple testing correction (FDR / Benjamini-Hochberg)
     res_df['FDR'] = multipletests(res_df['p_value'], method='fdr_bh')[1]
     res_df['-log10(p_value)'] = -np.log10(res_df['p_value'])
 
-    # --- Plotting ---
-    plt.figure(figsize=(10, 8))
-    
+    # --- Threshold Definitions ---
     sig_up = (res_df['FDR'] < 0.05) & (res_df['Log2FC'] > 1)
     sig_down = (res_df['FDR'] < 0.05) & (res_df['Log2FC'] < -1)
-    
+
+    # Find the exact raw p-value that corresponds to FDR = 0.05 to draw the line correctly
+    sig_pvals = res_df.loc[res_df['FDR'] < 0.05, 'p_value']
+    p_threshold = sig_pvals.max() if not sig_pvals.empty else 0.05
+
+    # --- Plotting ---
+    plt.figure(figsize=(10, 8))
+
     plt.scatter(res_df['Log2FC'], res_df['-log10(p_value)'], color='grey', alpha=0.3, s=20, label='Not Sig')
     plt.scatter(res_df.loc[sig_up, 'Log2FC'], res_df.loc[sig_up, '-log10(p_value)'], color='red', alpha=0.6, s=30, label=f'Up in {group_case}')
     plt.scatter(res_df.loc[sig_down, 'Log2FC'], res_df.loc[sig_down, '-log10(p_value)'], color='blue', alpha=0.6, s=30, label=f'Down in {group_case}')
-    
+
     # Highlight CP and check significance
     cp_info = {
         'Dataset': dataset_name,
@@ -115,14 +123,14 @@ def generate_volcano_plot(df, group_case, group_ctrl, dataset_name, pdf_obj):
         'Log2FC': np.nan,
         'FDR': np.nan
     }
-    
+
     cp_row = res_df[res_df['Gene'] == 'CP']
     if not cp_row.empty:
         cp_lfc = cp_row['Log2FC'].values[0]
         cp_fdr = cp_row['FDR'].values[0]
         cp_info['Log2FC'] = cp_lfc
         cp_info['FDR'] = cp_fdr
-        
+
         if cp_fdr < 0.05 and cp_lfc > 1:
             cp_info['Status'] = 'Sig Up'
         elif cp_fdr < 0.05 and cp_lfc < -1:
@@ -131,34 +139,33 @@ def generate_volcano_plot(df, group_case, group_ctrl, dataset_name, pdf_obj):
             cp_info['Status'] = 'Not Sig'
 
         plt.scatter(cp_lfc, cp_row['-log10(p_value)'].values[0], color='gold', edgecolor='black', s=200, marker='*', label='Ceruloplasmin (CP)', zorder=5)
-        plt.annotate('CP', (cp_lfc, cp_row['-log10(p_value)'].values[0]), 
-                     xytext=(5, 5), textcoords='offset points', fontweight='bold', fontsize=12)
+        plt.annotate('CP', (cp_lfc, cp_row['-log10(p_value)'].values[0]),
+                     xytext=(5, 5), textcoords='offset points', fontweight='bold', fontsize=10)
 
-    # Label Top 5 Up and Down genes (excluding CP to avoid double labeling)
-    top_up = res_df[sig_up].nsmallest(5, 'FDR')
-    top_down = res_df[sig_down].nsmallest(5, 'FDR')
-    top_genes = pd.concat([top_up, top_down])
-    
-    for _, row in top_genes.iterrows():
+    # Label ALL significant genes (using a smaller font to reduce clutter)
+    sig_genes = res_df[sig_up | sig_down]
+    for _, row in sig_genes.iterrows():
         if row['Gene'] != 'CP':
             plt.annotate(row['Gene'], (row['Log2FC'], row['-log10(p_value)']),
-                         xytext=(3, 3), textcoords='offset points', fontsize=9, alpha=0.8)
+                         xytext=(2, 2), textcoords='offset points', fontsize=5, alpha=0.8)
 
+    # Threshold lines
     plt.axvline(x=1, color='black', linestyle='--', linewidth=1, alpha=0.7)
     plt.axvline(x=-1, color='black', linestyle='--', linewidth=1, alpha=0.7)
-    plt.axhline(y=-np.log10(0.05), color='black', linestyle='--', linewidth=1, alpha=0.7)
-    
+    # Draw horizontal line at the true FDR cutoff boundary
+    plt.axhline(y=-np.log10(p_threshold), color='black', linestyle='--', linewidth=1, alpha=0.7, label='FDR Cutoff (0.05)')
+
     plt.title(f'Volcano Plot: {group_case} vs {group_ctrl}\n({dataset_name})')
     plt.xlabel('Log2 Fold Change')
     plt.ylabel('-Log10 p-value')
     plt.legend()
     plt.grid(True, alpha=0.3)
-    
+
     # Save the current figure to the PDF object
     pdf_obj.savefig(bbox_inches='tight')
     plt.close()
-    
-    return cp_info
+
+    return cp_info, set(res_df.loc[sig_up, 'Gene']), set(res_df.loc[sig_down, 'Gene'])
 
 
 # ==========================================
@@ -169,28 +176,42 @@ print("Loading cached datasets...")
 datasets = get_all_fragpipe_datasets(use_cache=True, load_peptides=False)
 
 cp_tracker = []
-pdf_path = "../plots/All_Volcano_Plots.pdf"
+# Dictionary to store sets of significant genes for overlap analysis
+workflow_overlaps = {
+    "Glyco-N": {"Up": [], "Down": []},
+    "LFQ-Comparable": {"Up": [], "Down": []},
+    "LFQ-IM-MS": {"Up": [], "Down": []}
+}
 
+pdf_path = "../plots/All_Volcano_Plots.pdf"
 print(f"\nGenerating Volcano Plots into a single multi-page PDF: {pdf_path}")
 
-# Open the multi-page PDF object
 with PdfPages(pdf_path) as pdf:
     for key, data in datasets.items():
         label = data["label"]
         prot_df = data["prot"]
         comparisons = data["comparisons"]
 
+        # Extract workflow root name (e.g., "Glyco-N" from "Glyco-N | Run 4")
+        wf_name = label.split(" | ")[0]
+
         for group_case, group_ctrl in comparisons:
             print(f"[*] Processing {label}: {group_case} vs {group_ctrl}...")
-            cp_result = generate_volcano_plot(
-                df=prot_df, 
-                group_case=group_case, 
-                group_ctrl=group_ctrl, 
+            cp_result, sig_up_set, sig_down_set = generate_volcano_plot(
+                df=prot_df,
+                group_case=group_case,
+                group_ctrl=group_ctrl,
                 dataset_name=label,
                 pdf_obj=pdf
             )
+
             if cp_result:
                 cp_tracker.append(cp_result)
+                # Only track overlaps for the main comparison (GALD vs Healthy donor)
+                # to keep the intersection logical across all runs.
+                if group_ctrl == 'Healthy donor':
+                    workflow_overlaps[wf_name]["Up"].append(sig_up_set)
+                    workflow_overlaps[wf_name]["Down"].append(sig_down_set)
 
 # --- Print CP Significance Summary ---
 print("\n" + "="*80)
@@ -198,11 +219,33 @@ print(" CERULOPLASMIN (CP) SIGNIFICANCE SUMMARY ACROSS ALL RUNS")
 print("="*80)
 
 cp_summary_df = pd.DataFrame(cp_tracker)
-
-# Format the floats for cleaner terminal output
 cp_summary_df['Log2FC'] = cp_summary_df['Log2FC'].map(lambda x: f"{x:.2f}" if pd.notnull(x) else "NaN")
 cp_summary_df['FDR'] = cp_summary_df['FDR'].map(lambda x: f"{x:.4e}" if pd.notnull(x) else "NaN")
-
 print(cp_summary_df.to_string(index=False))
+
+# --- Print Overlap Analysis ---
+print("\n" + "="*80)
+print(" OVERLAPPING SIGNIFICANT PROTEINS (GALD vs Healthy donor) ACROSS ALL RUNS")
 print("="*80)
+
+for wf_name, sets in workflow_overlaps.items():
+    print(f"\n--- {wf_name} ---")
+
+    # Check if we successfully collected sets for this workflow
+    if not sets["Up"]:
+        print("  No 'Healthy donor' comparisons available to intersect.")
+        continue
+
+    # Calculate intersection across all runs within the workflow
+    overlap_up = set.intersection(*sets["Up"])
+    overlap_down = set.intersection(*sets["Down"])
+
+    print(f"  Up in GALD across ALL {len(sets['Up'])} runs ({len(overlap_up)} proteins):")
+    print(f"    {', '.join(sorted(overlap_up)) if overlap_up else 'None'}")
+
+    print(f"  Down in GALD across ALL {len(sets['Down'])} runs ({len(overlap_down)} proteins):")
+    print(f"    {', '.join(sorted(overlap_down)) if overlap_down else 'None'}")
+
+print("\n" + "="*80)
 print(f"✅ All plots successfully saved to: {pdf_path}")
+

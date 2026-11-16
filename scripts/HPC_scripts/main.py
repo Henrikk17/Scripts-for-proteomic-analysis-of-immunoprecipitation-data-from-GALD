@@ -16,8 +16,6 @@ else:
 import pandas as pd
 import numpy as np
 from scipy.stats import ttest_ind, fisher_exact
-import statsmodels.api as sm
-from statsmodels.formula.api import ols
 from statsmodels.stats.multitest import multipletests
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
@@ -35,6 +33,12 @@ from helper_functions.load_fragPipe_proteomic_data import load_fragPipe_proteomi
 
 warnings.filterwarnings('ignore')
 
+# Force Pandas to print the entire Master Summary without truncating rows or columns
+pd.set_option('display.max_rows', None)
+pd.set_option('display.max_columns', None)
+pd.set_option('display.max_colwidth', None)
+pd.set_option('display.width', 1000)
+
 # ==========================================
 # 🎛️ EXECUTION TOGGLES (FOR DEBUGGING/SPEED)
 # ==========================================
@@ -51,7 +55,7 @@ RUN_SUMMARY = True
 FRAGPIPE_WORKFLOW = "imms"
 HIGHLIGHT_GENES = ["CP", "TFRC", "TFR2", "TAGLN2", "TLN1"]
 
-USE_FDR = True       
+USE_FDR = True       # Applies to Volcano T-tests. Fisher uses raw p-values.
 P_CUTOFF = 0.05      
 LOG2FC_CUTOFF = 1.0  
 
@@ -68,13 +72,27 @@ global_pep_counts_mq = {}
 global_pep_counts_fp = {}
 
 def extract_peptide_counts(raw_df, engine, run_label, gene_col='Gene'):
+    """
+    Robustly extracts peptide counts by aggressively hunting for MaxQuant and FragPipe specific headers.
+    """
     target_dict = global_pep_counts_mq if engine == 'mq' else global_pep_counts_fp
     
-    pep_cols = [c for c in raw_df.columns if 'peptide' in c.lower() and ('count' in c.lower() or 'razor' in c.lower() or 'total' in c.lower())]
-    if not pep_cols:
-        return 
-        
-    pep_col = pep_cols[0] 
+    # Priority list of column names indicating peptide counts
+    possible_cols = [
+        'Razor + unique peptides', 'Peptide counts (razor+unique)', 'Peptides',
+        'Total Peptides', 'Unique Peptides', 'Peptide count'
+    ]
+    
+    pep_col = next((c for c in possible_cols if c in raw_df.columns), None)
+    
+    # Fallback to loose string matching if exact headers aren't found
+    if not pep_col:
+        loose_matches = [c for c in raw_df.columns if 'peptide' in c.lower() and ('count' in c.lower() or 'razor' in c.lower())]
+        if loose_matches:
+            pep_col = loose_matches[0]
+            
+    if not pep_col:
+        return # Skip if strictly no peptide columns exist
     
     for _, row in raw_df.dropna(subset=[gene_col]).iterrows():
         gene = str(row[gene_col]).split(';')[0].strip()
@@ -106,7 +124,6 @@ def get_maxquant_datasets(base_dir="~/DTU-GALD"):
         extract_peptide_counts(prot_df, 'mq', key) 
         
         prot_df = prot_df[~prot_df['Sample'].isin(['sample_14', 'sample_56'])].copy()
-        
         mq_data[f"{key}_with_LB"] = prot_df.copy()
         
         if 'Sample_type' in prot_df.columns:
@@ -138,10 +155,7 @@ def run_run6_anova(prot_df_with_lb, engine_name):
 
     df = prot_df_with_lb.dropna(subset=['Gene']).copy()
     df['Gene'] = df['Gene'].astype(str).str.split(';').str[0].str.strip()
-    
-    # Robustly handle Sample strings (e.g. 'Sample_1' vs 'sample_1')
     df['Sample_Num'] = df['Sample'].astype(str).str.lower().str.replace('sample_', '', regex=False).astype(int)
-
     df['Subject_ID'] = df['Sample_Num'].apply(lambda n: n if n <= 42 else n - 42)
     
     if 'Sample_type' in df.columns:
@@ -149,19 +163,14 @@ def run_run6_anova(prot_df_with_lb, engine_name):
     else:
         df['Matrix'] = df['Sample_Num'].apply(lambda n: 'Liver' if n <= 42 else 'Buffer')
         
-    num_buffer = (df['Matrix'] == 'Buffer').sum()
-    print(f"  [*] Detected {num_buffer} raw Lysate Buffer data points in dataframe.")
-    
     if 'Buffer' not in df['Matrix'].values:
         print(f"  ⚠️ WARNING: No 'Lysate buffer' samples detected in {engine_name} data! Skipping ANOVA.")
         return {}
 
     sample_meta = df[['Sample', 'Subject_ID', 'Matrix', 'Group']].drop_duplicates().set_index('Sample')
-
     wide_df = df.pivot_table(index='Gene', columns='Sample', values=quant_col, aggfunc='sum')
     wide_df.replace(0, np.nan, inplace=True)
     wide_df = wide_df.dropna(thresh=5, axis=0) 
-    
     log2_df = np.log2(wide_df)
 
     np.random.seed(42)
@@ -255,6 +264,7 @@ def impute_perseus(wide_df):
             imputed.loc[mask, col] = np.random.normal(loc=m - 1.8 * s, scale=s * 0.3, size=mask.sum())
     return imputed
 
+
 # ==========================================
 # 4. MASTER ORCHESTRATOR
 # ==========================================
@@ -271,10 +281,13 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
     res_volcano, res_fisher, res_rf = {}, {}, {}
     
     for subset_name, (df_prot, g_case, g_ctrl) in subsets_dict.items():
-        print(f"  • Processing subset: {subset_name}")
+        print(f"\n  ➤ Processing subset: {subset_name}")
         wide_df, c_samps, k_samps, s_to_g = prep_wide_df(df_prot, g_case, g_ctrl)
         imputed_df = impute_perseus(wide_df)
         
+        # ==================================
+        # A. Volcano (T-Test) Analysis
+        # ==================================
         if RUN_VOLCANO:
             records = []
             for gene, row in imputed_df.iterrows():
@@ -291,20 +304,44 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
             for _, r in sig.iterrows():
                 res_volcano.setdefault(r['Gene'], []).append(f"{subset_name}({'Up' if r['Log2FC']>0 else 'Down'})")
 
+            # Print Top 10 Volcano Hits
+            top_v = sig.sort_values(by=stat).head(10)
+            if not top_v.empty:
+                print(f"    [Volcano Top Hits] -> {', '.join(top_v['Gene'].tolist())}")
+
             fig, ax = plt.subplots(figsize=(8,6))
             ax.scatter(v_df['Log2FC'], -np.log10(v_df['p_value']), alpha=0.5, color='grey', s=10)
             ax.scatter(sig['Log2FC'], -np.log10(sig['p_value']), alpha=0.8, color='firebrick', s=20)
             ax.set_title(f"{engine_name} Volcano: {subset_name}")
             pdf_volcano.savefig(fig, bbox_inches='tight'); plt.close()
 
+        # ==================================
+        # B. Fisher Exact Test (Binary Presence)
+        # ==================================
+        # Raw P-values only for Fisher. FDR is overly punishing for discrete distributions.
         if RUN_FISHER:
+            f_records = []
             for gene, row in wide_df.iterrows():
                 c_pres, k_pres = row[c_samps].notna().sum(), row[k_samps].notna().sum()
-                if c_pres > k_pres: 
+                if c_pres > k_pres: # Enriched in GALD
                     _, p = fisher_exact([[c_pres, len(c_samps)-c_pres], [k_pres, len(k_samps)-k_pres]])
-                    if p < P_CUTOFF:
-                        res_fisher.setdefault(gene, []).append(f"{subset_name}({c_pres}/{len(c_samps)} vs {k_pres}/{len(k_samps)})")
+                    f_records.append({'Gene': gene, 'p_value': p, 'c_pres': c_pres, 'k_pres': k_pres})
+            
+            f_df = pd.DataFrame(f_records).dropna()
+            if not f_df.empty:
+                f_sig = f_df[f_df['p_value'] < P_CUTOFF]
+                
+                for _, r in f_sig.iterrows():
+                    res_fisher.setdefault(r['Gene'], []).append(f"{subset_name}({r['c_pres']}/{len(c_samps)} vs {r['k_pres']}/{len(k_samps)})")
+                
+                # Print Top 10 Fisher Hits based on raw p-value
+                top_f = f_sig.sort_values(by='p_value').head(10)
+                if not top_f.empty:
+                    print(f"    [Fisher Top Hits]  -> {', '.join(top_f['Gene'].tolist())}")
 
+        # ==================================
+        # C. Principal Component Analysis
+        # ==================================
         if RUN_PCA:
             X_sc = StandardScaler().fit_transform(imputed_df.T)
             y = np.array([s_to_g[s] for s in imputed_df.columns])
@@ -315,6 +352,9 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
             ax.set_title(f"{engine_name} PCA: {subset_name}")
             pdf_pca.savefig(fig, bbox_inches='tight'); plt.close()
 
+        # ==================================
+        # D. Random Forest Classification
+        # ==================================
         if RUN_RF:
             X_sc = StandardScaler().fit_transform(imputed_df.T)
             y_bin = np.array([1 if s_to_g[s] == 'GALD' else 0 for s in imputed_df.columns])
@@ -342,7 +382,7 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
 # ==========================================
 def compile_master_summary(mq_res, fp_res):
     print("\n" + "="*70)
-    print("🏆 COMPILING MASTER CROSS-ENGINE SUMMARY")
+    print("🏆 COMPILING MASTER CROSS-ENGINE SUMMARY (Proteins passing >=2/4 subsets in BOTH Engines)")
     print("="*70)
     
     all_genes = set(mq_res['volcano_sig'].keys()) | set(mq_res['fisher_sig'].keys()) | set(mq_res['rf_sig'].keys()) | \
@@ -369,6 +409,7 @@ def compile_master_summary(mq_res, fp_res):
         mq_any = (in_mq_volc == "Yes" or in_mq_fish == "Yes" or in_mq_rf == "Yes")
         fp_any = (in_fp_volc == "Yes" or in_fp_fish == "Yes" or in_fp_rf == "Yes")
         
+        # Strict intersection: Target must hit >= 2 subsets in MaxQuant AND >= 2 subsets in FragPipe
         if not (mq_any and fp_any): 
             continue 
 
@@ -377,19 +418,20 @@ def compile_master_summary(mq_res, fp_res):
         
         summary_rows.append({
             'Gene': g,
-            'Detailed_Peptide_Counts': pep_string,
-            'Volcano (MQ|FP)': f"{in_mq_volc} | {in_fp_volc}",
-            'Fisher (MQ|FP)': f"{in_mq_fish} | {in_fp_fish}",
-            'RF Top20 (MQ|FP)': f"{in_mq_rf} | {in_fp_rf}",
-            'ANOVA Contaminant Check (MQ)': anova_mq,
-            'ANOVA Contaminant Check (FP)': anova_fp
+            'Peptide_Counts': pep_string,
+            'Volcano(MQ|FP)': f"{in_mq_volc}|{in_fp_volc}",
+            'Fisher(MQ|FP)': f"{in_mq_fish}|{in_fp_fish}",
+            'RF_Top20(MQ|FP)': f"{in_mq_rf}|{in_fp_rf}",
+            'ANOVA_Contaminant(MQ)': anova_mq,
+            'ANOVA_Contaminant(FP)': anova_fp
         })
 
     master_df = pd.DataFrame(summary_rows)
     out_file = OUT_DIR / "MASTER_CrossEngine_Relevant_Proteins.tsv"
     
     if not master_df.empty:
-        master_df = master_df.sort_values(by='ANOVA Contaminant Check (MQ)')
+        # Sort so the cleanest targets bubble to the top
+        master_df = master_df.sort_values(by='ANOVA_Contaminant(MQ)')
         master_df.to_csv(out_file, sep='\t', index=False)
         print(master_df.to_string(index=False))
     else:
@@ -403,10 +445,7 @@ if __name__ == "__main__":
     print("Loading data...")
     fp_all = get_all_fragpipe_datasets(use_cache=True, load_peptides=False)
     
-    # Explicitly load FragPipe Run 6 with LB from disk to bypass stripped cache
     print(f"📂 Loading raw FragPipe {FRAGPIPE_WORKFLOW.upper()} Run 6 (With LB) directly from disk...")
-    
-    # Support both "IM-MS" and "imms" folder naming conventions
     if FRAGPIPE_WORKFLOW.lower() == 'imms':
         fp_lb_path = os.path.expanduser("~/results/LFQ_MBR_IM-MS/run6_results_with_LB/")
     else:

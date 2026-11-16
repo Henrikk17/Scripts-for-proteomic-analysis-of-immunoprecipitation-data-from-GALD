@@ -108,7 +108,8 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
         'Protein names': 'Protein Name'
     }, inplace=True, errors='ignore')
 
-    # Clean multi-mapped MaxQuant gene names (e.g., "TAGLN2;TAGLN" -> "TAGLN2")
+
+# Clean multi-mapped MaxQuant gene names (e.g., "TAGLN2;TAGLN" -> "TAGLN2")
     if 'Gene' in prot_df.columns:
         prot_df['Gene'] = (
             prot_df['Gene']
@@ -118,6 +119,26 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
             .str.strip()
             .replace({'nan': np.nan, 'None': np.nan, '': np.nan})
         )
+
+    # ---> INJECTED PEPTIDE EXTRACTION <---
+    # Explicitly target the high-confidence Razor/Unique peptide count
+    target_pep_cols = ['Peptide counts (razor+unique)', 'Razor + unique peptides', 'Peptides']
+    pep_cols = [c for c in prot_df.columns if c in target_pep_cols]
+    
+    # Fallback if exact names aren't found
+    if not pep_cols:
+        pep_cols = [c for c in prot_df.columns if 'peptide' in c.lower() and ('count' in c.lower() or 'razor' in c.lower())]
+        
+    if pep_cols:
+        pep_col = pep_cols[0]
+        # Ensure it is numeric
+        prot_df[pep_col] = pd.to_numeric(prot_df[pep_col], errors='coerce')
+        # Add it to the list of variables that will survive the melt
+        prot_id_vars_target = ['Protein', 'Protein Group', 'Gene', 'Description', 'Protein Name', 'Score', 'Q-value', pep_col]
+    else:
+        prot_id_vars_target = ['Protein', 'Protein Group', 'Gene', 'Description', 'Protein Name', 'Score', 'Q-value']
+    # -------------------------------------
+
 
     # --- Dynamically grab MaxQuant LFQ Columns ---
     lfq_cols_prot = [c for c in prot_df.columns if c.startswith('LFQ intensity ')]

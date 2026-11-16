@@ -68,9 +68,12 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
         lfq_cols_prot = [c for c in prot_df.columns if c.endswith('Intensity') and not c.endswith('MaxLFQ Intensity')]
         suffix_prot = ' Intensity'
 
-    # --- Setup Safe ID Variables ---
-    prot_id_vars_target = ['Protein', 'Protein Group', 'Gene', 'Protein Description', 'Protein Name', 'Protein Probability']
+    prot_id_vars_target = ['Protein', 'Protein Group', 'Gene', 'Protein Description', 'Protein Name', 'Protein Probability', 'Combined Total Peptides'] 
+    #Now also gets the peptide count
+
     prot_id_vars = [col for col in prot_id_vars_target if col in prot_df.columns]
+
+    # --- Setup Safe ID Variables ---
 
     # Melt into long format
     melted_prot = prot_df.melt(
@@ -157,6 +160,8 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
     # --- Setup Safe ID Variables ---
     pep_id_vars_target = ['Peptide Sequence', 'Protein', 'Protein Group', 'Gene', 'Protein Name', 'Peptide Probability']
     pep_id_vars = [col for col in pep_id_vars_target if col in pep_df.columns]
+
+    
 
     # --- Melt into long format ---
     melted_pep = pep_df.melt(

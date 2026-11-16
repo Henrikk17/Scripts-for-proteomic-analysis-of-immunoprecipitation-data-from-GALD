@@ -8,7 +8,7 @@ from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-def analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_obj, use_fdr, p_cutoff, fc_cutoff):
+def analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_obj, use_fdr, p_cutoff, fc_cutoff, highlight_genes):
     records = []
     for gene, row in imputed_df.iterrows():
         c_vals, k_vals = row[c_samps].values, row[k_samps].values
@@ -22,6 +22,7 @@ def analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_
     sig = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'].abs() >= fc_cutoff)]
     
     top_hits = sig.sort_values(by=stat).head(10)['Gene'].tolist()
+    hl_hits = [g for g in highlight_genes if g in sig['Gene'].values]
     
     fig, ax = plt.subplots(figsize=(8,6))
     ax.scatter(v_df['Log2FC'], -np.log10(v_df['p_value']), alpha=0.5, color='grey', s=10)
@@ -29,9 +30,10 @@ def analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_
     ax.set_title(f"{engine_name} Volcano: {subset_name}")
     pdf_obj.savefig(fig, bbox_inches='tight'); plt.close()
     
-    return [f"{subset_name}({'Up' if r['Log2FC']>0 else 'Down'})" for _, r in sig.iterrows()], sig['Gene'].tolist(), top_hits
+    details = [f"{subset_name}({'Up' if r['Log2FC']>0 else 'Down'})" for _, r in sig.iterrows()]
+    return details, sig['Gene'].tolist(), top_hits, hl_hits
 
-def analyze_fisher(wide_df, c_samps, k_samps, subset_name, p_cutoff):
+def analyze_fisher(wide_df, c_samps, k_samps, subset_name, p_cutoff, highlight_genes):
     records = []
     for gene, row in wide_df.iterrows():
         c_pres, k_pres = row[c_samps].notna().sum(), row[k_samps].notna().sum()
@@ -40,12 +42,14 @@ def analyze_fisher(wide_df, c_samps, k_samps, subset_name, p_cutoff):
             records.append({'Gene': gene, 'p_value': p, 'c_pres': c_pres, 'k_pres': k_pres})
     
     f_df = pd.DataFrame(records).dropna()
-    if f_df.empty: return [], [], []
+    if f_df.empty: return [], [], [], []
     
     sig = f_df[f_df['p_value'] < p_cutoff]
     top_hits = sig.sort_values(by='p_value').head(10)['Gene'].tolist()
+    hl_hits = [g for g in highlight_genes if g in sig['Gene'].values]
+    
     details = [f"{subset_name}({r['c_pres']}/{len(c_samps)} vs {r['k_pres']}/{len(k_samps)})" for _, r in sig.iterrows()]
-    return details, sig['Gene'].tolist(), top_hits
+    return details, sig['Gene'].tolist(), top_hits, hl_hits
 
 def analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_obj):
     X_sc = StandardScaler().fit_transform(imputed_df.T)
@@ -57,15 +61,17 @@ def analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_obj):
     ax.set_title(f"{engine_name} PCA: {subset_name}")
     pdf_obj.savefig(fig, bbox_inches='tight'); plt.close()
 
-def analyze_rf(imputed_df, s_to_g, subset_name):
+def analyze_rf(imputed_df, s_to_g, subset_name, highlight_genes):
     X_sc = StandardScaler().fit_transform(imputed_df.T)
     y_bin = np.array([1 if s_to_g[s] == 'GALD' else 0 for s in imputed_df.columns])
     rf = RandomForestClassifier(n_estimators=300, random_state=42, class_weight='balanced')
     rf.fit(X_sc, y_bin)
     
     imp = pd.DataFrame({'Gene': imputed_df.index, 'Imp': rf.feature_importances_}).sort_values('Imp', ascending=False).head(20)
+    hl_hits = [g for g in highlight_genes if g in imp['Gene'].values]
+    
     details = [f"{subset_name}(#{i+1})" for i, r in enumerate(imp.iterrows())]
-    return details, imp['Gene'].tolist()
+    return details, imp['Gene'].tolist(), hl_hits
 
 def analyze_anova(prot_df_with_lb, engine_name, out_dir):
     print(f"\n🔬 Running ANOVA Contaminant Classification for {engine_name}...")

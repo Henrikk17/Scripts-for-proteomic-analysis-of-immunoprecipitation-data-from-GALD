@@ -9,27 +9,31 @@ from helper_functions.load_maxQuant_proteomic_data import load_maxQuant_proteomi
 global_pep_counts_mq = {}
 global_pep_counts_fp = {}
 
-def extract_peptide_counts(raw_df, engine, run_label, gene_col='Gene'):
-    """Extracts the highest unique/razor peptide count for each gene per run."""
+def extract_peptide_counts(melted_df, engine, run_label, gene_col='Gene'):
+    """
+    Extracts the highest unique/razor peptide count for each gene per run from the melted dataframe.
+    """
     target_dict = global_pep_counts_mq if engine == 'mq' else global_pep_counts_fp
-    possible_cols = ['Razor + unique peptides', 'Peptide counts (razor+unique)', 'Peptides', 'Total Peptides', 'Unique Peptides', 'Peptide count']
-    pep_col = next((c for c in possible_cols if c in raw_df.columns), None)
     
-    if not pep_col:
-        loose_matches = [c for c in raw_df.columns if 'peptide' in c.lower() and ('count' in c.lower() or 'razor' in c.lower())]
-        if loose_matches: pep_col = loose_matches[0]
-            
-    if not pep_col: return 
+    # Hunt for the peptide count column preserved by the loader
+    pep_cols = [c for c in melted_df.columns if 'peptide' in c.lower() and ('count' in c.lower() or 'razor' in c.lower() or 'total' in c.lower())]
     
-    for _, row in raw_df.dropna(subset=[gene_col]).iterrows():
-        gene = str(row[gene_col]).split(';')[0].strip()
-        try:
-            count = float(row[pep_col])
-            if not np.isnan(count):
-                if gene not in target_dict: target_dict[gene] = {}
-                target_dict[gene][run_label] = max(target_dict[gene].get(run_label, 0), int(count))
-        except (ValueError, TypeError):
-            pass
+    if not pep_cols:
+        print(f"  [⚠️ Warning] No peptide count column found in {engine.upper()} ({run_label}).")
+        return 
+        
+    pep_col = pep_cols[0] 
+    
+    # Since it's melted, multiple rows exist for the same gene. Group by Gene and get the max.
+    grouped = melted_df.dropna(subset=[gene_col, pep_col]).groupby(gene_col)[pep_col].max()
+    
+    for gene, max_count in grouped.items():
+        clean_gene = str(gene).split(';')[0].strip()
+        if clean_gene not in target_dict: 
+            target_dict[clean_gene] = {}
+        target_dict[clean_gene][run_label] = int(max_count)
+
+
 
 def get_maxquant_datasets(cache_dir, base_dir="~/DTU-GALD"):
     """Loads, filters, and caches MaxQuant datasets."""

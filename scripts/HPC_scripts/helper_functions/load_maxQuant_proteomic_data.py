@@ -124,11 +124,11 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
     # Explicitly target the high-confidence Razor/Unique peptide count
     target_pep_cols = ['Peptide counts (razor+unique)', 'Razor + unique peptides', 'Peptides']
     pep_cols = [c for c in prot_df.columns if c in target_pep_cols]
-    
+
     # Fallback if exact names aren't found
     if not pep_cols:
         pep_cols = [c for c in prot_df.columns if 'peptide' in c.lower() and ('count' in c.lower() or 'razor' in c.lower())]
-        
+
     if pep_cols:
         pep_col = pep_cols[0]
         # Ensure it is numeric
@@ -179,10 +179,16 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
     # ==========================================
     # 3. LOAD & MELT PEPTIDE DATA (OPTIONAL)
     # ==========================================
+
     if not load_peptides:
         return master_prot_df, None
 
-    print(f"Processing {pep_file}...")
+    # Fast bypass if peptides.txt is missing
+    if not pep_file.exists():
+        print(f"🚨 Warning: {pep_file.name} not found in {root_path}! Bypassing peptide loading for this dataset.")
+        return master_prot_df, None
+
+    print(f"Processing {pep_file.name}...")
     with warnings.catch_warnings():
         warnings.simplefilter(action='ignore', category=pd.errors.DtypeWarning)
         pep_df = pd.read_csv(pep_file, sep='\t', low_memory=False)

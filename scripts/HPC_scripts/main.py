@@ -81,11 +81,12 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
     if RUN_VOLCANO: pdf_volcano.close()
     if RUN_PCA: pdf_pca.close()
 
+    # Pass the full dictionaries (no pre-filtering) so the master summary can count subset appearances
     return {
         'anova_class': anova_classes,
-        'volcano_sig': {g: hits for g, hits in res_volcano.items() if len(hits) >= 2},
-        'fisher_sig': {g: hits for g, hits in res_fisher.items() if len(hits) >= 2},
-        'rf_sig': {g: hits for g, hits in res_rf.items() if len(hits) >= 2},
+        'volcano_hits': res_volcano,
+        'fisher_hits': res_fisher,
+        'rf_hits': res_rf,
     }
 
 # ==========================================
@@ -93,14 +94,33 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
 # ==========================================
 def compile_master_summary(mq_res, fp_res, mq_all, fp_all):
     print("\n" + "="*70 + "\n🏆 COMPILING MASTER CROSS-ENGINE SUMMARY (Proteins passing >=2/4 subsets in BOTH Engines)\n" + "="*70)
-    all_genes = set(mq_res['volcano_sig'].keys()) | set(mq_res['fisher_sig'].keys()) | set(mq_res['rf_sig'].keys()) | \
-                set(fp_res['volcano_sig'].keys()) | set(fp_res['fisher_sig'].keys()) | set(fp_res['rf_sig'].keys())
+    
+    def get_passed_genes(res):
+        passed = set()
+        all_g = set(res['volcano_hits'].keys()) | set(res['fisher_hits'].keys()) | set(res['rf_hits'].keys())
+        for g in all_g:
+            # Gene must pass in at least 2 subsets for at least one statistical test
+            if len(res['volcano_hits'].get(g, [])) >= 2 or len(res['fisher_hits'].get(g, [])) >= 2 or len(res['rf_hits'].get(g, [])) >= 2:
+                passed.add(g)
+        return passed
+        
+    mq_passed = get_passed_genes(mq_res)
+    fp_passed = get_passed_genes(fp_res)
+    
+    # Strict Intersection: Target must have >=2 hits in at least one MQ test AND >=2 hits in at least one FP test
+    valid_genes = mq_passed.intersection(fp_passed)
                 
     summary_rows = []
-    for g in all_genes:
-        mq_any = (g in mq_res['volcano_sig'] or g in mq_res['fisher_sig'] or g in mq_res['rf_sig'])
-        fp_any = (g in fp_res['volcano_sig'] or g in fp_res['fisher_sig'] or g in fp_res['rf_sig'])
-        if not (mq_any and fp_any): continue 
+    for g in valid_genes:
+        # Count subset occurrences 
+        v_mq = len(mq_res['volcano_hits'].get(g, []))
+        v_fp = len(fp_res['volcano_hits'].get(g, []))
+        f_mq = len(mq_res['fisher_hits'].get(g, []))
+        f_fp = len(fp_res['fisher_hits'].get(g, []))
+        r_mq = len(mq_res['rf_hits'].get(g, []))
+        r_fp = len(fp_res['rf_hits'].get(g, []))
+        
+        fmt = lambda x: str(x) if x > 0 else "-"
 
         r4_mq = get_gald_peptide_interval(mq_all['run4_no_LB'].get('pep'), g)
         r4_fp = get_gald_peptide_interval(fp_all['run4'].get('pep'), g)
@@ -116,9 +136,9 @@ def compile_master_summary(mq_res, fp_res, mq_all, fp_all):
         summary_rows.append({
             'Gene': g,
             'GALD Peptide Interval': pep_string,
-            'Volcano(MQ|FP)': f"{'Yes' if g in mq_res['volcano_sig'] else '-'}|{'Yes' if g in fp_res['volcano_sig'] else '-'}",
-            'Fisher(MQ|FP)': f"{'Yes' if g in mq_res['fisher_sig'] else '-'}|{'Yes' if g in fp_res['fisher_sig'] else '-'}",
-            'RF_Top20(MQ|FP)': f"{'Yes' if g in mq_res['rf_sig'] else '-'}|{'Yes' if g in fp_res['rf_sig'] else '-'}",
+            'Volcano(MQ|FP)': f"{fmt(v_mq)}|{fmt(v_fp)}",
+            'Fisher(MQ|FP)': f"{fmt(f_mq)}|{fmt(f_fp)}",
+            'RF_Top20(MQ|FP)': f"{fmt(r_mq)}|{fmt(r_fp)}",
             'ANOVA(MQ)': mq_res['anova_class'].get(g, "Not Evaluated"),
             'ANOVA(FP)': fp_res['anova_class'].get(g, "Not Evaluated")
         })

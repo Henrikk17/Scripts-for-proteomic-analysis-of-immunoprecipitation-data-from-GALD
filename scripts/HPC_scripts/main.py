@@ -3,6 +3,7 @@
 
 import os
 from pathlib import Path
+import concurrent.futures
 import matplotlib
 if os.environ.get('DISPLAY', '') == '': matplotlib.use('Agg')
 else: matplotlib.use('TkAgg')
@@ -32,6 +33,7 @@ RUN_VOLCANO, RUN_FISHER, RUN_PCA, RUN_RF, RUN_ANOVA, RUN_SUMMARY = True, True, T
 USE_FDR = True       
 P_CUTOFF = 0.05      
 LOG2FC_CUTOFF = 1.0  
+GLOBAL_SEED = 42
 
 HIGHLIGHT_GENES = ["CP", "TFRC", "TFR2", "TAGLN2", "TLN1", "PKM", "PROS1", "ACTR3"]
 
@@ -46,7 +48,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
     print(f"\n{'='*70}\n🚀 RUNNING PIPELINE: {engine_name}\n{'='*70}")
     
-    anova_classes = analyze_anova(prot_with_lb, engine_name, OUT_DIR) if RUN_ANOVA else {}
+    anova_classes = analyze_anova(prot_with_lb, engine_name, OUT_DIR, GLOBAL_SEED) if RUN_ANOVA else {}
     pdf_volcano = PdfPages(OUT_DIR / f"Volcano_{engine_name}.pdf") if RUN_VOLCANO else None
     pdf_pca = PdfPages(OUT_DIR / f"PCA_{engine_name}.pdf") if RUN_PCA else None
     
@@ -55,33 +57,32 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
     for subset_name, (df_prot, g_case, g_ctrl) in subsets_dict.items():
         print(f"\n  ➤ Processing subset: {subset_name}")
         wide_df, c_samps, k_samps, s_to_g = prep_wide_df(df_prot, g_case, g_ctrl)
-        imputed_df = impute_perseus(wide_df)
+        imputed_df = impute_perseus(wide_df, GLOBAL_SEED)
         
         if RUN_VOLCANO:
             det, genes, tops, hl_hits = analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_volcano, USE_FDR, P_CUTOFF, LOG2FC_CUTOFF, HIGHLIGHT_GENES)
             for g, d in zip(genes, det): res_volcano.setdefault(g, []).append(d)
-            if tops: print(f"    [Volcano Top 10] -> {', '.join(tops)}")
-            if hl_hits: print(f"    [Candidate Hit!] -> {', '.join(hl_hits)} (Significant in Volcano)")
+            if tops: print(f"    [{engine_name} Volcano Top 10] -> {', '.join(tops)}")
+            if hl_hits: print(f"    [{engine_name} Candidate Hit!] -> {', '.join(hl_hits)} (Significant in Volcano)")
 
         if RUN_FISHER:
             det, genes, tops, hl_hits = analyze_fisher(wide_df, c_samps, k_samps, subset_name, P_CUTOFF, HIGHLIGHT_GENES)
             for g, d in zip(genes, det): res_fisher.setdefault(g, []).append(d)
-            if tops: print(f"    [Fisher Top 10]  -> {', '.join(tops)}")
-            if hl_hits: print(f"    [Candidate Hit!] -> {', '.join(hl_hits)} (Significant in Fisher)")
+            if tops: print(f"    [{engine_name} Fisher Top 10]  -> {', '.join(tops)}")
+            if hl_hits: print(f"    [{engine_name} Candidate Hit!] -> {', '.join(hl_hits)} (Significant in Fisher)")
 
         if RUN_PCA: 
-            analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_pca)
+            analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_pca, GLOBAL_SEED)
         
         if RUN_RF:
-            det, genes, hl_hits = analyze_rf(imputed_df, s_to_g, subset_name, HIGHLIGHT_GENES)
+            det, genes, hl_hits = analyze_rf(imputed_df, s_to_g, subset_name, HIGHLIGHT_GENES, GLOBAL_SEED)
             for g, d in zip(genes, det): res_rf.setdefault(g, []).append(d)
-            if genes: print(f"    [RF Top 20]      -> {', '.join(genes)}")
-            if hl_hits: print(f"    [Candidate Hit!] -> {', '.join(hl_hits)} (In Random Forest Top 20)")
+            if genes: print(f"    [{engine_name} RF Top 20]      -> {', '.join(genes)}")
+            if hl_hits: print(f"    [{engine_name} Candidate Hit!] -> {', '.join(hl_hits)} (In Random Forest Top 20)")
 
     if RUN_VOLCANO: pdf_volcano.close()
     if RUN_PCA: pdf_pca.close()
 
-    # Pass the full dictionaries (no pre-filtering) so the master summary can count subset appearances
     return {
         'anova_class': anova_classes,
         'volcano_hits': res_volcano,
@@ -99,20 +100,16 @@ def compile_master_summary(mq_res, fp_res, mq_all, fp_all):
         passed = set()
         all_g = set(res['volcano_hits'].keys()) | set(res['fisher_hits'].keys()) | set(res['rf_hits'].keys())
         for g in all_g:
-            # Gene must pass in at least 2 subsets for at least one statistical test
             if len(res['volcano_hits'].get(g, [])) >= 2 or len(res['fisher_hits'].get(g, [])) >= 2 or len(res['rf_hits'].get(g, [])) >= 2:
                 passed.add(g)
         return passed
         
     mq_passed = get_passed_genes(mq_res)
     fp_passed = get_passed_genes(fp_res)
-    
-    # Strict Intersection: Target must have >=2 hits in at least one MQ test AND >=2 hits in at least one FP test
     valid_genes = mq_passed.intersection(fp_passed)
                 
     summary_rows = []
     for g in valid_genes:
-        # Count subset occurrences 
         v_mq = len(mq_res['volcano_hits'].get(g, []))
         v_fp = len(fp_res['volcano_hits'].get(g, []))
         f_mq = len(mq_res['fisher_hits'].get(g, []))
@@ -156,14 +153,15 @@ def compile_master_summary(mq_res, fp_res, mq_all, fp_all):
 if __name__ == "__main__":
     print("Loading ONLY IM-MS FragPipe and MaxQuant data...")
     
-    # ⚠️ These new caches are strictly for this master pipeline to avoid external conflicts
     fp_all = get_fragpipe_imms_datasets(CACHE_DIR)
     mq_all = get_maxquant_datasets(CACHE_DIR)
     
     fp_sub = build_four_subsets(fp_all["run4"]["prot"], fp_all["run5"]["prot"], fp_all["run6_no_LB"]["prot"])
     mq_sub = build_four_subsets(mq_all["run4_no_LB"]["prot"], mq_all["run5_no_LB"]["prot"], mq_all["run6_no_LB"]["prot"])
 
+    # Run sequentially to avoid Matplotlib & Scikit-Learn deadlocks
     mq_results = run_engine_pipeline(mq_sub, mq_all["run6_with_LB"]["prot"], "MaxQuant")
     fp_results = run_engine_pipeline(fp_sub, fp_all["run6_with_LB"]["prot"], "FragPipe_IMMS")
 
-    if RUN_SUMMARY: compile_master_summary(mq_results, fp_results, mq_all, fp_all)
+    if RUN_SUMMARY: 
+        compile_master_summary(mq_results, fp_results, mq_all, fp_all)

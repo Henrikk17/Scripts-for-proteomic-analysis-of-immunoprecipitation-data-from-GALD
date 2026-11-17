@@ -7,14 +7,11 @@ from helper_functions.load_maxQuant_proteomic_data import load_maxQuant_proteomi
 from helper_functions.load_fragPipe_proteomic_data import load_fragPipe_proteomic_data
 
 def get_fragpipe_imms_datasets(cache_dir, base_dir="~/results/LFQ_MBR_IM-MS"):
-    """Loads, filters, and caches ONLY the FragPipe IM-MS datasets, deriving no_LB from with_LB."""
     cache_file = cache_dir / "fp_imms_master_data.pkl"
     if cache_file.exists():
         with open(cache_file, "rb") as f: return pickle.load(f)
 
     base_path = Path(base_dir).expanduser()
-    
-    # We completely drop "run6_no_LB" from the disk load
     run_specs = {
         "run4": {"path": base_path / "run4_results", "annot": "../experiment_annotation/experiment_annotation_run4_R876.tsv"},
         "run5": {"path": base_path / "run5_results", "annot": "../experiment_annotation/experiment_annotation_run5_R1101.tsv"},
@@ -23,19 +20,12 @@ def get_fragpipe_imms_datasets(cache_dir, base_dir="~/results/LFQ_MBR_IM-MS"):
 
     fp_data = {}
     for key, spec in run_specs.items():
-        print(f"Loading FragPipe IM-MS: {key}...")
         prot_df, pep_df = load_fragPipe_proteomic_data(ROOT=spec["path"], annotation_file=spec["annot"])
-        
-        # Remove QC samples
         prot_df = prot_df[~prot_df['Sample'].isin(['sample_14', 'sample_56'])].copy()
-        if pep_df is not None:
-            pep_df = pep_df[~pep_df['Sample'].isin(['sample_14', 'sample_56'])].copy()
+        if pep_df is not None: pep_df = pep_df[~pep_df['Sample'].isin(['sample_14', 'sample_56'])].copy()
             
         if key == "run6":
-            # Save the full run (With Buffer)
             fp_data["run6_with_LB"] = {"prot": prot_df.copy(), "pep": pep_df.copy() if pep_df is not None else None}
-            
-            # Dynamically derive the strictly filtered run (Liver Lysate only)
             if 'Sample_type' in prot_df.columns:
                 fp_data["run6_no_LB"] = {
                     "prot": prot_df[prot_df['Sample_type'].astype(str).str.strip() == 'Liver Lysate'].copy(),
@@ -50,7 +40,6 @@ def get_fragpipe_imms_datasets(cache_dir, base_dir="~/results/LFQ_MBR_IM-MS"):
     return fp_data
 
 def get_maxquant_datasets(cache_dir, base_dir="~/DTU-GALD"):
-    """Loads, filters, and caches MaxQuant datasets, INCLUDING peptide data."""
     cache_file = cache_dir / "mq_master_data.pkl"
     if cache_file.exists():
         with open(cache_file, "rb") as f: return pickle.load(f)
@@ -63,16 +52,13 @@ def get_maxquant_datasets(cache_dir, base_dir="~/DTU-GALD"):
     
     mq_data = {}
     for key, spec in run_specs.items():
-        print(f"Loading MaxQuant: {key}...")
         txt_dir = find_maxquant_txt_dir(spec["req_id"], base_dir=base_dir)
         prot_df, pep_df = load_maxQuant_proteomic_data(ROOT=txt_dir, annotation_file=spec["annot"], load_peptides=True)
         
         prot_df = prot_df[~prot_df['Sample'].isin(['sample_14', 'sample_56'])].copy()
-        if pep_df is not None:
-            pep_df = pep_df[~pep_df['Sample'].isin(['sample_14', 'sample_56'])].copy()
+        if pep_df is not None: pep_df = pep_df[~pep_df['Sample'].isin(['sample_14', 'sample_56'])].copy()
             
         mq_data[f"{key}_with_LB"] = {"prot": prot_df.copy(), "pep": pep_df.copy() if pep_df is not None else None}
-        
         if 'Sample_type' in prot_df.columns:
             mq_data[f"{key}_no_LB"] = {
                 "prot": prot_df[prot_df['Sample_type'].astype(str).str.strip() == 'Liver Lysate'].copy(),
@@ -85,15 +71,11 @@ def get_maxquant_datasets(cache_dir, base_dir="~/DTU-GALD"):
     return mq_data
 
 def get_gald_peptide_interval(pep_df, gene):
-    """Calculates the min-max interval of unique peptides detected in GALD mothers."""
     if pep_df is None or pep_df.empty: return "-"
-    
     subset = pep_df[(pep_df['Gene'] == gene) & (pep_df['Group'] == 'GALD')]
     if subset.empty: return "0"
-    
     counts = subset.groupby('Sample')['Peptide Sequence'].nunique()
     if counts.empty: return "0"
-    
     min_c, max_c = counts.min(), counts.max()
     return str(min_c) if min_c == max_c else f"{min_c}-{max_c}"
 
@@ -117,17 +99,17 @@ def prep_wide_df(df, group_case, group_ctrl):
     wide_df = df_clean.pivot_table(index='Gene', columns='Sample', values=quant_col, aggfunc='sum')
     wide_df.replace(0, np.nan, inplace=True)
     target_samples = [s for s in (c_samps + k_samps) if s in wide_df.columns]
-    
     return wide_df[target_samples].dropna(thresh=3, axis=0), [s for s in c_samps if s in target_samples], [s for s in k_samps if s in target_samples], s_to_g
 
-def impute_perseus(wide_df):
+def impute_perseus(wide_df, seed):
+    rng = np.random.default_rng(seed)
     log2_df = np.log2(wide_df)
-    np.random.seed(42)
     imputed = log2_df.copy()
+    
     for col in imputed.columns:
         val = imputed[col].dropna()
         if len(val) > 2:
             m, s = val.mean(), val.std()
             mask = imputed[col].isna()
-            imputed.loc[mask, col] = np.random.normal(loc=m - 1.8 * s, scale=s * 0.3, size=mask.sum())
+            imputed.loc[mask, col] = rng.normal(loc=m - 1.8 * s, scale=s * 0.3, size=mask.sum())
     return imputed

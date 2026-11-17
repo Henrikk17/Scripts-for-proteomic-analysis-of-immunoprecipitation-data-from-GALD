@@ -3,10 +3,8 @@
 
 import os
 from pathlib import Path
-import concurrent.futures
 import matplotlib
-if os.environ.get('DISPLAY', '') == '': matplotlib.use('Agg')
-else: matplotlib.use('TkAgg')
+matplotlib.use('Agg')  # Strictly force headless mode to prevent Tkinter core dumps
 
 import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
@@ -35,7 +33,7 @@ P_CUTOFF = 0.05
 LOG2FC_CUTOFF = 1.0  
 GLOBAL_SEED = 42
 
-HIGHLIGHT_GENES = ["CP", "TFRC", "TFR2", "TAGLN2", "TLN1", "PKM", "PROS1", "ACTR3"]
+HIGHLIGHT_GENES = ["CP", "HP", "TFRC", "TFR2"]
 
 OUT_DIR = Path("../plots/mq_vs_fragpipe_comparison")
 CACHE_DIR = Path("../cache_master_pipeline")
@@ -48,7 +46,8 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
     print(f"\n{'='*70}\n🚀 RUNNING PIPELINE: {engine_name}\n{'='*70}")
     
-    anova_classes = analyze_anova(prot_with_lb, engine_name, OUT_DIR, GLOBAL_SEED) if RUN_ANOVA else {}
+    # Passing HIGHLIGHT_GENES into the ANOVA function here
+    anova_classes = analyze_anova(prot_with_lb, engine_name, OUT_DIR, GLOBAL_SEED, HIGHLIGHT_GENES) if RUN_ANOVA else {}
     pdf_volcano = PdfPages(OUT_DIR / f"Volcano_{engine_name}.pdf") if RUN_VOLCANO else None
     pdf_pca = PdfPages(OUT_DIR / f"PCA_{engine_name}.pdf") if RUN_PCA else None
     
@@ -63,13 +62,13 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
             det, genes, tops, hl_hits = analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_volcano, USE_FDR, P_CUTOFF, LOG2FC_CUTOFF, HIGHLIGHT_GENES)
             for g, d in zip(genes, det): res_volcano.setdefault(g, []).append(d)
             if tops: print(f"    [{engine_name} Volcano Top 10] -> {', '.join(tops)}")
-            if hl_hits: print(f"    [{engine_name} Candidate Hit!] -> {', '.join(hl_hits)} (Significant in Volcano)")
+            if hl_hits: print(f"      * Candidate Hit(s): {', '.join(hl_hits)} (Volcano)")
 
         if RUN_FISHER:
             det, genes, tops, hl_hits = analyze_fisher(wide_df, c_samps, k_samps, subset_name, P_CUTOFF, HIGHLIGHT_GENES)
             for g, d in zip(genes, det): res_fisher.setdefault(g, []).append(d)
             if tops: print(f"    [{engine_name} Fisher Top 10]  -> {', '.join(tops)}")
-            if hl_hits: print(f"    [{engine_name} Candidate Hit!] -> {', '.join(hl_hits)} (Significant in Fisher)")
+            if hl_hits: print(f"      * Candidate Hit(s): {', '.join(hl_hits)} (Fisher)")
 
         if RUN_PCA: 
             analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_pca, GLOBAL_SEED)
@@ -78,7 +77,7 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
             det, genes, hl_hits = analyze_rf(imputed_df, s_to_g, subset_name, HIGHLIGHT_GENES, GLOBAL_SEED)
             for g, d in zip(genes, det): res_rf.setdefault(g, []).append(d)
             if genes: print(f"    [{engine_name} RF Top 20]      -> {', '.join(genes)}")
-            if hl_hits: print(f"    [{engine_name} Candidate Hit!] -> {', '.join(hl_hits)} (In Random Forest Top 20)")
+            if hl_hits: print(f"      * Candidate Hit(s): {', '.join(hl_hits)} (Random Forest)")
 
     if RUN_VOLCANO: pdf_volcano.close()
     if RUN_PCA: pdf_pca.close()
@@ -165,3 +164,5 @@ if __name__ == "__main__":
 
     if RUN_SUMMARY: 
         compile_master_summary(mq_results, fp_results, mq_all, fp_all)
+        
+    print(f"\n📁 All plots successfully generated and saved to: {OUT_DIR.resolve()}")

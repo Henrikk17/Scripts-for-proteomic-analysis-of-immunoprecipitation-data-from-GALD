@@ -8,35 +8,88 @@ from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+
 def analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_obj, use_fdr, p_cutoff, fc_cutoff, highlight_genes):
-    # Vectorized T-Test on entire matrix instantly
     c_data = imputed_df[c_samps].values
     k_data = imputed_df[k_samps].values
     genes = imputed_df.index.values
     
+    # Log2FC = Mean(GALD) - Mean(Control). Positive = Abundant in GALD.
     log2fc = np.mean(c_data, axis=1) - np.mean(k_data, axis=1)
     _, p_vals = ttest_ind(c_data, k_data, axis=1, equal_var=False)
     
     v_df = pd.DataFrame({'Gene': genes, 'Log2FC': log2fc, 'p_value': p_vals}).dropna()
     v_df['FDR'] = multipletests(v_df['p_value'], method='fdr_bh')[1]
     stat = 'FDR' if use_fdr else 'p_value'
-    sig = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'].abs() >= fc_cutoff)]
+    
+    # STRICT DIRECTIONAL FILTER: Evaluate GALD-abundant (Up) vs GALD-depleted (Down)
+    sig = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'] >= fc_cutoff)]
+    down = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'] <= -fc_cutoff)]
     
     top_hits = sig.sort_values(by=stat).head(10)['Gene'].tolist()
     hl_hits = [g for g in highlight_genes if g in sig['Gene'].values]
     
     if pdf_obj:
-        fig, ax = plt.subplots(figsize=(8,6))
-        ax.scatter(v_df['Log2FC'], -np.log10(v_df['p_value']), alpha=0.5, color='grey', s=10)
-        ax.scatter(sig['Log2FC'], -np.log10(sig['p_value']), alpha=0.8, color='firebrick', s=20)
+        fig, ax = plt.subplots(figsize=(10,8))
+        
+        # Plot all background points
+        ax.scatter(v_df['Log2FC'], -np.log10(v_df[stat]), alpha=0.5, color='grey', s=10, zorder=1)
+        
+        # Highlight significant points
+        ax.scatter(sig['Log2FC'], -np.log10(sig[stat]), alpha=0.8, color='firebrick', s=20, zorder=2)
+        ax.scatter(down['Log2FC'], -np.log10(down[stat]), alpha=0.8, color='steelblue', s=20, zorder=2)
+        
+        # Draw threshold lines
         ax.set_title(f"{engine_name} Volcano: {subset_name}")
+        ax.axvline(x=fc_cutoff, color='firebrick', linestyle=':', linewidth=1.5)
+        ax.axvline(x=-fc_cutoff, color='steelblue', linestyle=':', linewidth=1.5)
+        ax.axhline(y=-np.log10(p_cutoff), color='black', linestyle=':', linewidth=1.5)
+        
+        # Add labels to ALL significant genes (Skipping highlight_genes so they don't double-print)
+        for _, row in sig.iterrows():
+            if row['Gene'] not in highlight_genes:
+                ax.text(row['Log2FC'] + 0.05, -np.log10(row[stat]), str(row['Gene']), 
+                        fontsize=6, color='firebrick', va='bottom', ha='left')
+                
+        for _, row in down.iterrows():
+            if row['Gene'] not in highlight_genes:
+                ax.text(row['Log2FC'] - 0.05, -np.log10(row[stat]), str(row['Gene']), 
+                        fontsize=6, color='steelblue', va='bottom', ha='right')
+
+        # DISTINCT HIGHLIGHT PLOTTING (Searches the whole dataset, ignores significance cutoffs)
+        target_markers = ['*', '^', 'D', 's']           # Star, Triangle, Diamond, Square
+        target_colors = ['gold', 'lime', 'magenta', 'cyan']
+        
+        for idx, target in enumerate(highlight_genes):
+            if target in v_df['Gene'].values:
+                row = v_df[v_df['Gene'] == target].iloc[0]
+                m = target_markers[idx % len(target_markers)]
+                c = target_colors[idx % len(target_colors)]
+                
+                # Plot massive, bold shape with a black outline on the top layer (zorder=10)
+                ax.scatter(row['Log2FC'], -np.log10(row[stat]), color=c, marker=m, 
+                           s=120, edgecolor='black', linewidth=1, zorder=10)
+                
+                # Label dynamically shifts based on whether it is on the left or right side
+                align_ha = 'left' if row['Log2FC'] >= 0 else 'right'
+                offset = 0.08 if row['Log2FC'] >= 0 else -0.08
+                
+                # Modest size (fontsize=7), but bolded so it cuts through the noise
+                ax.text(row['Log2FC'] + offset, -np.log10(row[stat]), str(row['Gene']), 
+                        fontsize=7, color='black', fontweight='bold', va='bottom', ha=align_ha, zorder=11)
+
+        y_label_text = r'$-\log_{10}(\text{FDR})$' if use_fdr else r'$-\log_{10}(\text{p-value})$'
+        ax.set_xlabel(r'$\log_2(\text{Fold Change})$ (GALD vs Control)')
+        ax.set_ylabel(y_label_text)
+        
         pdf_obj.savefig(fig, bbox_inches='tight'); plt.close()
     
-    details = [f"{subset_name}({'Up' if r['Log2FC']>0 else 'Down'})" for _, r in sig.iterrows()]
+    details = [f"{subset_name}(Up)" for _, r in sig.iterrows()]
     return details, sig['Gene'].tolist(), top_hits, hl_hits
 
+
+
 def analyze_fisher(wide_df, c_samps, k_samps, subset_name, p_cutoff, highlight_genes):
-    # Numpy array extraction to bypass Pandas looping overhead
     c_pres = wide_df[c_samps].notna().sum(axis=1).values
     k_pres = wide_df[k_samps].notna().sum(axis=1).values
     genes = wide_df.index.values
@@ -45,6 +98,7 @@ def analyze_fisher(wide_df, c_samps, k_samps, subset_name, p_cutoff, highlight_g
     records = []
     
     for g, cp, kp in zip(genes, c_pres, k_pres):
+        # STRICT DIRECTIONAL FILTER: Only calculate if detected more frequently in GALD
         if cp > kp: 
             _, p = fisher_exact([[cp, n_c - cp], [kp, n_k - kp]])
             records.append({'Gene': g, 'p_value': p, 'c_pres': cp, 'k_pres': kp})
@@ -75,12 +129,24 @@ def analyze_rf(imputed_df, s_to_g, subset_name, highlight_genes, seed):
     rf = RandomForestClassifier(n_estimators=300, random_state=seed, class_weight='balanced', n_jobs=-1)
     rf.fit(X_sc, y_bin)
     
-    imp = pd.DataFrame({'Gene': imputed_df.index, 'Imp': rf.feature_importances_}).sort_values('Imp', ascending=False).head(20)
+    imp_df = pd.DataFrame({'Gene': imputed_df.index, 'Imp': rf.feature_importances_})
+    
+    # STRICT DIRECTIONAL FILTER: Force RF to only extract targets where GALD Mean > Control Mean
+    # BOUNDARY FIX: Only check samples that actually exist in the current imputed_df subset
+    c_samps = [s for s in imputed_df.columns if s_to_g[s] == 'GALD']
+    k_samps = [s for s in imputed_df.columns if s_to_g[s] != 'GALD']
+    
+    gald_mean = imputed_df[c_samps].mean(axis=1).values
+    ctrl_mean = imputed_df[k_samps].mean(axis=1).values
+    
+    imp_df['GALD_Abundant'] = gald_mean > ctrl_mean
+    imp = imp_df[imp_df['GALD_Abundant']].sort_values('Imp', ascending=False).head(20)
+    
     hl_hits = [g for g in highlight_genes if g in imp['Gene'].values]
     details = [f"{subset_name}(#{i+1})" for i, r in enumerate(imp.iterrows())]
     return details, imp['Gene'].tolist(), hl_hits
 
-def analyze_anova(prot_df_with_lb, engine_name, out_dir, seed):
+def analyze_anova(prot_df_with_lb, engine_name, out_dir, seed, highlight_genes):
     print(f"\n🔬 Running ANOVA Contaminant Classification for {engine_name}...")
     quant_col = 'Razor Intensity' if 'Razor Intensity' in prot_df_with_lb.columns else ('MaxLFQ Intensity' if 'MaxLFQ Intensity' in prot_df_with_lb.columns else 'Intensity')
     df = prot_df_with_lb.dropna(subset=['Gene']).copy()
@@ -92,13 +158,11 @@ def analyze_anova(prot_df_with_lb, engine_name, out_dir, seed):
     else: df['Matrix'] = df['Sample_Num'].apply(lambda n: 'Liver' if n <= 42 else 'Buffer')
         
     if 'Buffer' not in df['Matrix'].values:
-        print(f"  ⚠️ WARNING: No 'Lysate buffer' samples detected in {engine_name}! Skipping ANOVA.")
         return {}
 
     sample_meta = df[['Sample', 'Subject_ID', 'Matrix', 'Group']].drop_duplicates().set_index('Sample')
     wide_df = df.pivot_table(index='Gene', columns='Sample', values=quant_col, aggfunc='sum').replace(0, np.nan).dropna(thresh=5, axis=0)
     
-    # Modern RNG Imputation
     rng = np.random.default_rng(seed)
     imputed_df = np.log2(wide_df).copy()
     for col in imputed_df.columns:
@@ -131,5 +195,18 @@ def analyze_anova(prot_df_with_lb, engine_name, out_dir, seed):
         else: return "Non-Specific Fetal Liver Background"
             
     res['ANOVA_Class'] = res.apply(classify, axis=1)
+    
+    # Extract True Targets and sort by highest Fold Change instead of p-value
+    promising = res[res['ANOVA_Class'] == "True Fetal Liver Target (GALD Enriched)"]
+    top_anova_df = promising.sort_values(by='Log2FC_Liver_vs_Buffer', ascending=False).head(10)
+    top_anova = top_anova_df['Gene'].tolist()
+    
+    print(f"    [{engine_name} ANOVA Top 10 (Highest Fold Change True Targets)] -> {', '.join(top_anova) if top_anova else 'None found'}")
+    
+    # Highlight specific targets and their math
+    candidate_hits = promising[promising['Gene'].isin(highlight_genes)]
+    for _, row in candidate_hits.iterrows():
+        print(f"      * Candidate Hit in ANOVA: {row['Gene']} (Log2FC vs Buffer: {row['Log2FC_Liver_vs_Buffer']:.2f}, p-value: {row['P_Paired_Delta']:.2e})")
+    
     res.to_csv(out_dir / f"Run6_ANOVA_Classification_{engine_name}.txt", sep='\t', index=False)
     return res.set_index('Gene')['ANOVA_Class'].to_dict()

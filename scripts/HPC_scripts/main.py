@@ -52,6 +52,7 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
     pdf_pca = PdfPages(OUT_DIR / f"PCA_{engine_name}.pdf") if RUN_PCA else None
     
     res_volcano, res_fisher, res_rf = {}, {}, {}
+    engine_enriched_records = []
     
     for subset_name, (df_prot, g_case, g_ctrl) in subsets_dict.items():
         print(f"\n  ➤ Processing subset: {subset_name}")
@@ -59,16 +60,30 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
         imputed_df = impute_perseus(wide_df, GLOBAL_SEED)
         
         if RUN_VOLCANO:
-            det, genes, tops, hl_hits = analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_volcano, USE_FDR, P_CUTOFF, LOG2FC_CUTOFF, HIGHLIGHT_GENES)
+            det, sig_df, tops, hl_hits = analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_volcano, USE_FDR, P_CUTOFF, LOG2FC_CUTOFF, HIGHLIGHT_GENES)
+            genes = sig_df['Gene'].tolist()
             for g, d in zip(genes, det): res_volcano.setdefault(g, []).append(d)
             if tops: print(f"    [{engine_name} Volcano Top 10] -> {', '.join(tops)}")
             if hl_hits: print(f"      * Candidate Hit(s): {', '.join(hl_hits)} (Volcano)")
+            
+            if not sig_df.empty:
+                v_out = sig_df.copy()
+                v_out['Subset'] = subset_name
+                v_out['Analysis'] = 'Volcano'
+                engine_enriched_records.append(v_out)
 
         if RUN_FISHER:
-            det, genes, tops, hl_hits = analyze_fisher(wide_df, c_samps, k_samps, subset_name, P_CUTOFF, HIGHLIGHT_GENES)
+            det, sig_df, tops, hl_hits = analyze_fisher(wide_df, c_samps, k_samps, subset_name, P_CUTOFF, HIGHLIGHT_GENES)
+            genes = sig_df['Gene'].tolist()
             for g, d in zip(genes, det): res_fisher.setdefault(g, []).append(d)
             if tops: print(f"    [{engine_name} Fisher Top 10]  -> {', '.join(tops)}")
             if hl_hits: print(f"      * Candidate Hit(s): {', '.join(hl_hits)} (Fisher)")
+            
+            if not sig_df.empty:
+                f_out = sig_df.copy()
+                f_out['Subset'] = subset_name
+                f_out['Analysis'] = 'Fisher'
+                engine_enriched_records.append(f_out)
 
         if RUN_PCA: 
             analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_pca, GLOBAL_SEED)
@@ -81,6 +96,16 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
 
     if RUN_VOLCANO: pdf_volcano.close()
     if RUN_PCA: pdf_pca.close()
+
+    # Compile and export all enriched subsets for this engine
+    if engine_enriched_records:
+        df_out = pd.concat(engine_enriched_records, ignore_index=True)
+        col_order = ['Subset', 'Analysis', 'Gene', 'Log2FC', 'p_value', 'FDR', 'c_pres', 'k_pres']
+        ordered_cols = [c for c in col_order if c in df_out.columns]
+        
+        # Sort by Subset -> Analysis -> Most Significant p_value
+        df_out = df_out[ordered_cols].sort_values(by=['Subset', 'Analysis', 'p_value'])
+        df_out.to_csv(OUT_DIR / f"{engine_name}_Enriched_Proteins.txt", sep='\t', index=False)
 
     return {
         'bg_class': bg_classes,

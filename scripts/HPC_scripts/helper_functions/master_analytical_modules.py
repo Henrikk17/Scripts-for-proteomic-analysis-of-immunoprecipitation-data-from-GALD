@@ -14,7 +14,6 @@ def analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_
     k_data = imputed_df[k_samps].values
     genes = imputed_df.index.values
     
-    # Log2FC = Mean(GALD) - Mean(Control). Positive = Abundant in GALD.
     log2fc = np.mean(c_data, axis=1) - np.mean(k_data, axis=1)
     _, p_vals = ttest_ind(c_data, k_data, axis=1, equal_var=False)
     
@@ -22,9 +21,8 @@ def analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_
     v_df['FDR'] = multipletests(v_df['p_value'], method='fdr_bh')[1]
     stat = 'FDR' if use_fdr else 'p_value'
     
-    # STRICT DIRECTIONAL FILTER: Evaluate GALD-abundant (Up) vs GALD-depleted (Down)
-    sig = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'] >= fc_cutoff)]
-    down = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'] <= -fc_cutoff)]
+    sig = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'] >= fc_cutoff)].copy()
+    down = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'] <= -fc_cutoff)].copy()
     
     top_hits = sig.sort_values(by=stat).head(10)['Gene'].tolist()
     hl_hits = [g for g in highlight_genes if g in sig['Gene'].values]
@@ -32,20 +30,15 @@ def analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_
     if pdf_obj:
         fig, ax = plt.subplots(figsize=(10,8))
         
-        # Plot all background points
         ax.scatter(v_df['Log2FC'], -np.log10(v_df[stat]), alpha=0.5, color='grey', s=10, zorder=1)
-        
-        # Highlight significant points
         ax.scatter(sig['Log2FC'], -np.log10(sig[stat]), alpha=0.8, color='firebrick', s=20, zorder=2)
         ax.scatter(down['Log2FC'], -np.log10(down[stat]), alpha=0.8, color='steelblue', s=20, zorder=2)
         
-        # Draw threshold lines
         ax.set_title(f"{engine_name} Volcano: {subset_name}")
         ax.axvline(x=fc_cutoff, color='firebrick', linestyle=':', linewidth=1.5)
         ax.axvline(x=-fc_cutoff, color='steelblue', linestyle=':', linewidth=1.5)
         ax.axhline(y=-np.log10(p_cutoff), color='black', linestyle=':', linewidth=1.5)
         
-        # Add labels to ALL significant genes (Skipping highlight_genes so they don't double-print)
         for _, row in sig.iterrows():
             if row['Gene'] not in highlight_genes:
                 ax.text(row['Log2FC'] + 0.05, -np.log10(row[stat]), str(row['Gene']), 
@@ -56,8 +49,7 @@ def analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_
                 ax.text(row['Log2FC'] - 0.05, -np.log10(row[stat]), str(row['Gene']), 
                         fontsize=6, color='steelblue', va='bottom', ha='right')
 
-        # DISTINCT HIGHLIGHT PLOTTING (Searches the whole dataset, ignores significance cutoffs)
-        target_markers = ['*', '^', 'D', 's']           # Star, Triangle, Diamond, Square
+        target_markers = ['*', '^', 'D', 's']
         target_colors = ['gold', 'lime', 'magenta', 'cyan']
         
         for idx, target in enumerate(highlight_genes):
@@ -66,15 +58,12 @@ def analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_
                 m = target_markers[idx % len(target_markers)]
                 c = target_colors[idx % len(target_colors)]
                 
-                # Plot massive, bold shape with a black outline on the top layer (zorder=10)
                 ax.scatter(row['Log2FC'], -np.log10(row[stat]), color=c, marker=m, 
                            s=120, edgecolor='black', linewidth=1, zorder=10)
                 
-                # Label dynamically shifts based on whether it is on the left or right side
                 align_ha = 'left' if row['Log2FC'] >= 0 else 'right'
                 offset = 0.08 if row['Log2FC'] >= 0 else -0.08
                 
-                # Modest size (fontsize=7), but bolded so it cuts through the noise
                 ax.text(row['Log2FC'] + offset, -np.log10(row[stat]), str(row['Gene']), 
                         fontsize=7, color='black', fontweight='bold', va='bottom', ha=align_ha, zorder=11)
 
@@ -85,9 +74,7 @@ def analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_
         pdf_obj.savefig(fig, bbox_inches='tight'); plt.close()
     
     details = [f"{subset_name}(Up)" for _, r in sig.iterrows()]
-    return details, sig['Gene'].tolist(), top_hits, hl_hits
-
-
+    return details, sig, top_hits, hl_hits
 
 def analyze_fisher(wide_df, c_samps, k_samps, subset_name, p_cutoff, highlight_genes):
     c_pres = wide_df[c_samps].notna().sum(axis=1).values
@@ -98,19 +85,19 @@ def analyze_fisher(wide_df, c_samps, k_samps, subset_name, p_cutoff, highlight_g
     records = []
     
     for g, cp, kp in zip(genes, c_pres, k_pres):
-        # STRICT DIRECTIONAL FILTER: Only calculate if detected more frequently in GALD
         if cp > kp: 
             _, p = fisher_exact([[cp, n_c - cp], [kp, n_k - kp]])
             records.append({'Gene': g, 'p_value': p, 'c_pres': cp, 'k_pres': kp})
     
     f_df = pd.DataFrame(records).dropna()
-    if f_df.empty: return [], [], [], []
+    if f_df.empty: return [], pd.DataFrame(), [], []
     
-    sig = f_df[f_df['p_value'] < p_cutoff]
+    sig = f_df[f_df['p_value'] < p_cutoff].copy()
     top_hits = sig.sort_values(by='p_value').head(10)['Gene'].tolist()
     hl_hits = [g for g in highlight_genes if g in sig['Gene'].values]
     details = [f"{subset_name}({r['c_pres']}/{n_c} vs {r['k_pres']}/{n_k})" for _, r in sig.iterrows()]
-    return details, sig['Gene'].tolist(), top_hits, hl_hits
+    
+    return details, sig, top_hits, hl_hits
 
 def analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_obj, seed):
     X_sc = StandardScaler().fit_transform(imputed_df.T)
@@ -151,7 +138,10 @@ def analyze_background_ttest(prot_df_with_lb, engine_name, out_dir, seed, highli
     quant_col = 'Razor Intensity' if 'Razor Intensity' in prot_df_with_lb.columns else ('MaxLFQ Intensity' if 'MaxLFQ Intensity' in prot_df_with_lb.columns else 'Intensity')
     df = prot_df_with_lb.dropna(subset=['Gene']).copy()
     df['Gene'] = df['Gene'].astype(str).str.split(';').str[0].str.strip()
+    
     df['Sample_Num'] = df['Sample'].astype(str).str.lower().str.replace('sample_', '', regex=False).astype(int)
+    
+    # n <= 42 perfectly maps 1-42 as Liver, and pairs 43 (Buffer) to Subject 1
     df['Subject_ID'] = df['Sample_Num'].apply(lambda n: n if n <= 42 else n - 42)
     
     if 'Sample_type' in df.columns: df['Matrix'] = df['Sample_type'].apply(lambda x: 'Buffer' if 'buffer' in str(x).lower() else 'Liver')
@@ -174,21 +164,41 @@ def analyze_background_ttest(prot_df_with_lb, engine_name, out_dir, seed, highli
 
     records = []
     for gene, row in imputed_df.iterrows():
-        sub = pd.DataFrame({'Intensity': row.values, 'Matrix': [sample_meta.loc[c, 'Matrix'] for c in imputed_df.columns], 'Subject_ID': [sample_meta.loc[c, 'Subject_ID'] for c in imputed_df.columns], 'Cohort': [str(sample_meta.loc[c, 'Group']).strip() for c in imputed_df.columns]})
-        piv = sub.pivot(index='Subject_ID', columns='Matrix', values='Intensity')
+        sub = pd.DataFrame({
+            'Intensity': row.values, 
+            'Matrix': [sample_meta.loc[c, 'Matrix'] for c in imputed_df.columns], 
+            'Subject_ID': [sample_meta.loc[c, 'Subject_ID'] for c in imputed_df.columns], 
+            'Cohort': [str(sample_meta.loc[c, 'Group']).strip() for c in imputed_df.columns]
+        })
+        
+        # FIXED: Upgraded to pivot_table to prevent crashes on accidental technical replicates
+        piv = sub.pivot_table(index='Subject_ID', columns='Matrix', values='Intensity', aggfunc='mean')
         if 'Liver' not in piv.columns or 'Buffer' not in piv.columns: continue
+        
         piv['Delta'] = piv['Liver'] - piv['Buffer']
         piv['Cohort'] = sub.drop_duplicates('Subject_ID').set_index('Subject_ID')['Cohort']
         
         log2fc_matrix = sub[sub['Matrix'] == 'Liver']['Intensity'].mean() - sub[sub['Matrix'] == 'Buffer']['Intensity'].mean()
-        gald_d, ctrl_d = piv[piv['Cohort'] == 'GALD']['Delta'].dropna(), piv[piv['Cohort'] != 'GALD']['Delta'].dropna()
-        p_delta = ttest_ind(gald_d, ctrl_d, equal_var=False)[1] if len(gald_d) > 1 and len(ctrl_d) > 1 else np.nan
+        
+        gald_d = piv[piv['Cohort'] == 'GALD']['Delta'].dropna()
+        ctrl_d = piv[piv['Cohort'] != 'GALD']['Delta'].dropna()
+        
+        p_delta = np.nan
+        if len(gald_d) > 1 and len(ctrl_d) > 1:
+            # FIXED (Directionality): Ensure the Delta is actually HIGHER in GALD before running the test
+            if gald_d.mean() > ctrl_d.mean():
+                p_delta = ttest_ind(gald_d, ctrl_d, equal_var=False)[1]
+            else:
+                p_delta = 1.0 # Force insignificance if controls have a higher tissue delta
+                
         records.append({'Gene': gene, 'Log2FC_Liver_vs_Buffer': log2fc_matrix, 'P_Paired_Delta': p_delta})
 
-    res = pd.DataFrame(records).dropna()
+    # FIXED: Drop NaNs before FDR to prevent statsmodels from crashing
+    res = pd.DataFrame(records).dropna(subset=['P_Paired_Delta', 'Log2FC_Liver_vs_Buffer'])
     if res.empty: return {}
     
     res['FDR_Paired_Delta'] = multipletests(res['P_Paired_Delta'], method='fdr_bh')[1]
+    
     def classify(r):
         if r['Log2FC_Liver_vs_Buffer'] <= 0.5: return "Contaminant (Maternal/Buffer Carryover)"
         elif r['P_Paired_Delta'] < 0.05: return "True Fetal Liver Target (GALD Enriched)"

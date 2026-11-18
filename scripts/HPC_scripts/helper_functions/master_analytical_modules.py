@@ -146,8 +146,8 @@ def analyze_rf(imputed_df, s_to_g, subset_name, highlight_genes, seed):
     details = [f"{subset_name}(#{i+1})" for i, r in enumerate(imp.iterrows())]
     return details, imp['Gene'].tolist(), hl_hits
 
-def analyze_anova(prot_df_with_lb, engine_name, out_dir, seed, highlight_genes):
-    print(f"\n🔬 Running ANOVA Contaminant Classification for {engine_name}...")
+def analyze_background_ttest(prot_df_with_lb, engine_name, out_dir, seed, highlight_genes):
+    print(f"\n🔬 Running Welch's T-Test Contaminant Classification for {engine_name}...")
     quant_col = 'Razor Intensity' if 'Razor Intensity' in prot_df_with_lb.columns else ('MaxLFQ Intensity' if 'MaxLFQ Intensity' in prot_df_with_lb.columns else 'Intensity')
     df = prot_df_with_lb.dropna(subset=['Gene']).copy()
     df['Gene'] = df['Gene'].astype(str).str.split(';').str[0].str.strip()
@@ -194,19 +194,17 @@ def analyze_anova(prot_df_with_lb, engine_name, out_dir, seed, highlight_genes):
         elif r['P_Paired_Delta'] < 0.05: return "True Fetal Liver Target (GALD Enriched)"
         else: return "Non-Specific Fetal Liver Background"
             
-    res['ANOVA_Class'] = res.apply(classify, axis=1)
+    res['Classification'] = res.apply(classify, axis=1)
     
-    # Extract True Targets and sort by highest Fold Change instead of p-value
-    promising = res[res['ANOVA_Class'] == "True Fetal Liver Target (GALD Enriched)"]
-    top_anova_df = promising.sort_values(by='Log2FC_Liver_vs_Buffer', ascending=False).head(10)
-    top_anova = top_anova_df['Gene'].tolist()
+    promising = res[res['Classification'] == "True Fetal Liver Target (GALD Enriched)"]
+    top_ttest_df = promising.sort_values(by='Log2FC_Liver_vs_Buffer', ascending=False).head(10)
+    top_ttest = top_ttest_df['Gene'].tolist()
     
-    print(f"    [{engine_name} ANOVA Top 10 (Highest Fold Change True Targets)] -> {', '.join(top_anova) if top_anova else 'None found'}")
+    print(f"    [{engine_name} Welch's T-Test Top 10 (Highest Fold Change True Targets)] -> {', '.join(top_ttest) if top_ttest else 'None found'}")
     
-    # Highlight specific targets and their math
     candidate_hits = promising[promising['Gene'].isin(highlight_genes)]
     for _, row in candidate_hits.iterrows():
-        print(f"      * Candidate Hit in ANOVA: {row['Gene']} (Log2FC vs Buffer: {row['Log2FC_Liver_vs_Buffer']:.2f}, p-value: {row['P_Paired_Delta']:.2e})")
+        print(f"      * Candidate Hit in Welch's T-Test: {row['Gene']} (Log2FC vs Buffer: {row['Log2FC_Liver_vs_Buffer']:.2f}, p-value: {row['P_Paired_Delta']:.2e})")
     
-    res.to_csv(out_dir / f"Run6_ANOVA_Classification_{engine_name}.txt", sep='\t', index=False)
-    return res.set_index('Gene')['ANOVA_Class'].to_dict()
+    res.to_csv(out_dir / f"Run6_Welchs_TTest_Classification_{engine_name}.txt", sep='\t', index=False)
+    return res.set_index('Gene')['Classification'].to_dict()

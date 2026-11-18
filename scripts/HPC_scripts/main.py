@@ -4,7 +4,7 @@
 import os
 from pathlib import Path
 import matplotlib
-matplotlib.use('Agg')  # Strictly force headless mode to prevent Tkinter core dumps
+matplotlib.use('Agg')  
 
 import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
@@ -15,7 +15,7 @@ from helper_functions.master_data_handlers import (
     prep_wide_df, impute_perseus, get_gald_peptide_interval
 )
 from helper_functions.master_analytical_modules import (
-    analyze_volcano, analyze_fisher, analyze_pca, analyze_rf, analyze_anova
+    analyze_volcano, analyze_fisher, analyze_pca, analyze_rf, analyze_background_ttest
 )
 
 pd.set_option('display.max_rows', None)
@@ -26,7 +26,8 @@ pd.set_option('display.width', 1000)
 # ==========================================
 # CONFIGURATION
 # ==========================================
-RUN_VOLCANO, RUN_FISHER, RUN_PCA, RUN_RF, RUN_ANOVA, RUN_SUMMARY = True, True, True, True, True, True
+# Renamed RUN_ANOVA to RUN_BACKGROUND_TTEST
+RUN_VOLCANO, RUN_FISHER, RUN_PCA, RUN_RF, RUN_BACKGROUND_TTEST, RUN_SUMMARY = True, True, True, True, True, True
 
 USE_FDR = True       
 P_CUTOFF = 0.05      
@@ -46,8 +47,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
     print(f"\n{'='*70}\n🚀 RUNNING PIPELINE: {engine_name}\n{'='*70}")
     
-    # Passing HIGHLIGHT_GENES into the ANOVA function here
-    anova_classes = analyze_anova(prot_with_lb, engine_name, OUT_DIR, GLOBAL_SEED, HIGHLIGHT_GENES) if RUN_ANOVA else {}
+    bg_classes = analyze_background_ttest(prot_with_lb, engine_name, OUT_DIR, GLOBAL_SEED, HIGHLIGHT_GENES) if RUN_BACKGROUND_TTEST else {}
     pdf_volcano = PdfPages(OUT_DIR / f"Volcano_{engine_name}.pdf") if RUN_VOLCANO else None
     pdf_pca = PdfPages(OUT_DIR / f"PCA_{engine_name}.pdf") if RUN_PCA else None
     
@@ -83,7 +83,7 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
     if RUN_PCA: pdf_pca.close()
 
     return {
-        'anova_class': anova_classes,
+        'bg_class': bg_classes,
         'volcano_hits': res_volcano,
         'fisher_hits': res_fisher,
         'rf_hits': res_rf,
@@ -135,15 +135,16 @@ def compile_master_summary(mq_res, fp_res, mq_all, fp_all):
             'Volcano(MQ|FP)': f"{fmt(v_mq)}|{fmt(v_fp)}",
             'Fisher(MQ|FP)': f"{fmt(f_mq)}|{fmt(f_fp)}",
             'RF_Top20(MQ|FP)': f"{fmt(r_mq)}|{fmt(r_fp)}",
-            'ANOVA(MQ)': mq_res['anova_class'].get(g, "Not Evaluated"),
-            'ANOVA(FP)': fp_res['anova_class'].get(g, "Not Evaluated")
+            'Background_TTest(MQ)': mq_res['bg_class'].get(g, "Not Evaluated"),
+            'Background_TTest(FP)': fp_res['bg_class'].get(g, "Not Evaluated")
         })
 
     master_df = pd.DataFrame(summary_rows)
     out_file = OUT_DIR / "MASTER_CrossEngine_Relevant_Proteins.tsv"
     
     if not master_df.empty:
-        master_df = master_df.sort_values(by='ANOVA(MQ)')
+        # Sort by the newly named background class column
+        master_df = master_df.sort_values(by='Background_TTest(MQ)')
         master_df.to_csv(out_file, sep='\t', index=False)
         print(master_df.to_string(index=False))
     else:
@@ -158,7 +159,6 @@ if __name__ == "__main__":
     fp_sub = build_four_subsets(fp_all["run4"]["prot"], fp_all["run5"]["prot"], fp_all["run6_no_LB"]["prot"])
     mq_sub = build_four_subsets(mq_all["run4_no_LB"]["prot"], mq_all["run5_no_LB"]["prot"], mq_all["run6_no_LB"]["prot"])
 
-    # Run sequentially to avoid Matplotlib & Scikit-Learn deadlocks
     mq_results = run_engine_pipeline(mq_sub, mq_all["run6_with_LB"]["prot"], "MaxQuant")
     fp_results = run_engine_pipeline(fp_sub, fp_all["run6_with_LB"]["prot"], "FragPipe_IMMS")
 

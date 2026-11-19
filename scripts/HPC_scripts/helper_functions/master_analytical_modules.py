@@ -100,15 +100,112 @@ def analyze_fisher(wide_df, c_samps, k_samps, subset_name, p_cutoff, highlight_g
     return details, sig, top_hits, hl_hits
 
 def analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_obj, seed):
-    X_sc = StandardScaler().fit_transform(imputed_df.T)
-    y = np.array([s_to_g[s] for s in imputed_df.columns])
-    pcs = PCA(n_components=2, random_state=seed).fit_transform(X_sc)
-    
+    clean_df = imputed_df.dropna(axis=0)
+    if clean_df.shape[0] < 2 or clean_df.shape[1] < 2:
+        return
+
+    # Mean-center only (preserve log2 fold-change scale without inflating imputed noise)
+    X_sc = StandardScaler(with_std=False).fit_transform(clean_df.T)
+    y = np.array([s_to_g[s] for s in clean_df.columns])
+
+    pca = PCA(n_components=2, random_state=seed)
+    pcs = pca.fit_transform(X_sc)
+    var_pct = pca.explained_variance_ratio_ * 100
+
     if pdf_obj:
-        fig, ax = plt.subplots()
-        sns.scatterplot(x=pcs[:,0], y=pcs[:,1], hue=y, ax=ax)
+        fig, ax = plt.subplots(figsize=(9, 7))
+        sns.scatterplot(x=pcs[:, 0], y=pcs[:, 1], hue=y, ax=ax, s=45, zorder=2)
+
         ax.set_title(f"{engine_name} PCA: {subset_name}")
-        pdf_obj.savefig(fig, bbox_inches='tight'); plt.close()
+        ax.set_xlabel(f"PC1 ({var_pct[0]:.1f}%)")
+        ax.set_ylabel(f"PC2 ({var_pct[1]:.1f}%)")
+
+        # Draw once so axis limits and transforms are finalized
+        fig.canvas.draw()
+
+        labels = [
+            f"sample {str(col).lower().replace('sample_', '').replace('sample', '').strip()}"
+            for col in clean_df.columns
+        ]
+
+        # Start labels centered on each point in display (pixel) coordinates
+        disp_pts = ax.transData.transform(pcs)
+        pos = disp_pts.copy()
+
+        # Estimate label half-widths and half-heights in pixels
+        fontsize = 6.5
+        char_w = fontsize * 0.58
+        box_h = fontsize * 1.35 + 4.0
+        pad_x, pad_y = 4.0, 2.0
+
+        half_w = np.array([(len(lbl) * char_w) / 2.0 + pad_x for lbl in labels])
+        half_h = np.full(len(labels), box_h / 2.0 + pad_y)
+
+        # Iterative bounding-box repulsion in pixel space to reduce overlap
+        n_pts = len(labels)
+        for _ in range(80):
+            moved = False
+            for i in range(n_pts):
+                for j in range(i + 1, n_pts):
+                    dx = pos[i, 0] - pos[j, 0]
+                    dy = pos[i, 1] - pos[j, 1]
+                    min_dx = half_w[i] + half_w[j]
+                    min_dy = half_h[i] + half_h[j]
+
+                    if abs(dx) < min_dx and abs(dy) < min_dy:
+                        overlap_x = min_dx - abs(dx)
+                        overlap_y = min_dy - abs(dy)
+
+                        # Push along the axis with smaller overlap
+                        if overlap_x < overlap_y:
+                            sign = 1.0 if dx >= 0 else -1.0
+                            shift = sign * (overlap_x * 0.5 + 0.5)
+                            pos[i, 0] += shift
+                            pos[j, 0] -= shift
+                        else:
+                            sign = 1.0 if dy >= 0 else -1.0
+                            shift = sign * (overlap_y * 0.5 + 0.5)
+                            pos[i, 1] += shift
+                            pos[j, 1] -= shift
+                        moved = True
+            if not moved:
+                break
+
+        inv_trans = ax.transData.inverted()
+        for idx, lbl in enumerate(labels):
+            lx, ly = inv_trans.transform(pos[idx])
+            ax.text(
+                lx, ly, lbl,
+                fontsize=fontsize,
+                alpha=0.9,
+                ha="center",
+                va="center",
+                zorder=3
+            )
+
+            # Draw a subtle leader line if a label was pushed away from its point
+            dist = np.hypot(pos[idx, 0] - disp_pts[idx, 0], pos[idx, 1] - disp_pts[idx, 1])
+            if dist > 6.0:
+                ax.plot(
+                    [pcs[idx, 0], lx], [pcs[idx, 1], ly],
+                    color="grey", linewidth=0.5, alpha=0.6, zorder=2
+                )
+
+        # Expand axis limits slightly if pushed labels sit near the edge
+        all_label_data = inv_trans.transform(pos)
+        x_min, x_max = ax.get_xlim()
+        y_min, y_max = ax.get_ylim()
+        ax.set_xlim(
+            min(x_min, float(all_label_data[:, 0].min()) - 0.03 * abs(x_max - x_min)),
+            max(x_max, float(all_label_data[:, 0].max()) + 0.03 * abs(x_max - x_min)),
+        )
+        ax.set_ylim(
+            min(y_min, float(all_label_data[:, 1].min()) - 0.03 * abs(y_max - y_min)),
+            max(y_max, float(all_label_data[:, 1].max()) + 0.03 * abs(y_max - y_min)),
+        )
+
+        pdf_obj.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
 
 def analyze_rf(imputed_df, s_to_g, subset_name, highlight_genes, seed):
     X_sc = StandardScaler().fit_transform(imputed_df.T)

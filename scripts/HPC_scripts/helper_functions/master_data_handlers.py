@@ -103,13 +103,29 @@ def prep_wide_df(df, group_case, group_ctrl):
 
 def impute_perseus(wide_df, seed):
     rng = np.random.default_rng(seed)
-    log2_df = np.log2(wide_df)
+    safe_df = wide_df.where(wide_df > 0)
+    log2_df = np.log2(safe_df)
     imputed = log2_df.copy()
-    
+
+    # Global fallback in case a column has <= 2 valid proteins
+    all_vals = log2_df.values[~np.isnan(log2_df.values)]
+    global_m = float(np.mean(all_vals)) if len(all_vals) > 0 else 0.0
+    global_s = float(np.std(all_vals, ddof=1)) if len(all_vals) > 1 else 1.0
+
     for col in imputed.columns:
         val = imputed[col].dropna()
+        mask = imputed[col].isna()
+        if not mask.any():
+            continue
+
         if len(val) > 2:
             m, s = val.mean(), val.std()
-            mask = imputed[col].isna()
-            imputed.loc[mask, col] = rng.normal(loc=m - 1.8 * s, scale=s * 0.3, size=mask.sum())
+        else:
+            m, s = global_m, global_s
+
+        if np.isnan(s) or s == 0:
+            s = global_s if global_s > 0 else 1.0
+
+        imputed.loc[mask, col] = rng.normal(loc=m - 1.8 * s, scale=s * 0.3, size=mask.sum())
+
     return imputed

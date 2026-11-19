@@ -80,23 +80,33 @@ def analyze_fisher(wide_df, c_samps, k_samps, subset_name, p_cutoff, highlight_g
     c_pres = wide_df[c_samps].notna().sum(axis=1).values
     k_pres = wide_df[k_samps].notna().sum(axis=1).values
     genes = wide_df.index.values
-    
+
     n_c, n_k = len(c_samps), len(k_samps)
     records = []
-    
+
     for g, cp, kp in zip(genes, c_pres, k_pres):
-        if cp > kp: 
+        if cp > kp:
             _, p = fisher_exact([[cp, n_c - cp], [kp, n_k - kp]])
-            records.append({'Gene': g, 'p_value': p, 'c_pres': cp, 'k_pres': kp})
-    
-    f_df = pd.DataFrame(records).dropna()
-    if f_df.empty: return [], pd.DataFrame(), [], []
-    
+            records.append({
+                'Gene': g,
+                'p_value': p,
+                'GALD_sample_presence': int(cp),
+                'Non-GALD_sample_presence': int(kp)
+            })
+
+    f_df = pd.DataFrame(records).dropna(subset=['p_value'])
+    if f_df.empty:
+        return [], pd.DataFrame(), [], []
+
+    # Raw p-value cutoff only (no FDR adjustment for Fisher's exact test)
     sig = f_df[f_df['p_value'] < p_cutoff].copy()
     top_hits = sig.sort_values(by='p_value').head(10)['Gene'].tolist()
     hl_hits = [g for g in highlight_genes if g in sig['Gene'].values]
-    details = [f"{subset_name}({r['c_pres']}/{n_c} vs {r['k_pres']}/{n_k})" for _, r in sig.iterrows()]
-    
+    details = [
+        f"{subset_name}({r['GALD_sample_presence']}/{n_c} vs {r['Non-GALD_sample_presence']}/{n_k})"
+        for _, r in sig.iterrows()
+    ]
+
     return details, sig, top_hits, hl_hits
 
 def analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_obj, seed):

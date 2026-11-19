@@ -30,7 +30,7 @@ pd.set_option('display.width', 1000)
 RUN_VOLCANO, RUN_FISHER, RUN_PCA, RUN_RF, RUN_BACKGROUND_TTEST, RUN_SUMMARY = True, True, True, True, True, True
 
 # Experimental feature toggle (set to False to disable)
-RUN_PERM_VOLCANO = True
+RUN_PERM_VOLCANO = False
 N_PERMUTATIONS = 250
 
 USE_FDR = True
@@ -112,6 +112,8 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
                 f_out = sig_df.copy()
                 f_out['Subset'] = subset_name
                 f_out['Analysis'] = 'Fisher'
+                f_out['Log2FC'] = pd.Series(dtype='float64', index=f_out.index)
+                f_out['FDR'] = pd.Series(dtype='float64', index=f_out.index)
                 engine_enriched_records.append(f_out)
 
         if RUN_PCA:
@@ -134,10 +136,22 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
         pdf_pca.close()
 
     # Compile and export all enriched subsets for this engine
-    if engine_enriched_records:
-        df_out = pd.concat(engine_enriched_records, ignore_index=True)
-        col_order = ['Subset', 'Analysis', 'Gene', 'Log2FC', 'p_value', 'FDR', 'c_pres', 'k_pres']
+    non_empty_records = [df_rec for df_rec in engine_enriched_records if not df_rec.empty]
+    if non_empty_records:
+        df_out = pd.concat(non_empty_records, ignore_index=True)
+        col_order = [
+            'Subset', 'Analysis', 'Gene', 'Log2FC', 'p_value', 'FDR',
+            'GALD_sample_presence', 'Non-GALD_sample_presence'
+        ]
         ordered_cols = [c for c in col_order if c in df_out.columns]
+
+        for num_col in ['Log2FC', 'p_value', 'FDR']:
+            if num_col in df_out.columns:
+                df_out[num_col] = pd.to_numeric(df_out[num_col], errors='coerce')
+
+        for pres_col in ['GALD_sample_presence', 'Non-GALD_sample_presence']:
+            if pres_col in df_out.columns:
+                df_out[pres_col] = pd.to_numeric(df_out[pres_col], errors='coerce').astype('Int64')
 
         df_out = df_out[ordered_cols].sort_values(by=['Subset', 'Analysis', 'p_value'])
         df_out.to_csv(OUT_DIR / f"{engine_name}_Enriched_Proteins.txt", sep='\t', index=False)

@@ -218,3 +218,159 @@ def analyze_background_ttest(prot_df_with_lb, engine_name, out_dir, seed, highli
     
     res.to_csv(out_dir / f"Run6_Welchs_TTest_Classification_{engine_name}.txt", sep='\t', index=False)
     return res.set_index('Gene')['Classification'].to_dict()
+
+def analyze_permutation_volcano(
+    imputed_df, c_samps, k_samps, subset_name, engine_name,
+    pdf_obj, p_cutoff, fc_cutoff, highlight_genes, seed, n_perm=250
+):
+    c_data = imputed_df[c_samps].values
+    k_data = imputed_df[k_samps].values
+    genes = imputed_df.index.values
+
+    # Observed GALD vs Control (positive Log2FC = more abundant in GALD)
+    log2fc_obs = np.mean(c_data, axis=1) - np.mean(k_data, axis=1)
+    _, p_obs = ttest_ind(c_data, k_data, axis=1, equal_var=False, nan_policy='omit')
+    neg_log10_p_obs = -np.log10(np.clip(p_obs, 1e-300, 1.0))
+
+    # Build empirical null by shuffling sample labels across combined matrix
+    X = np.hstack([c_data, k_data])
+    n_c = len(c_samps)
+    n_total = X.shape[1]
+    rng = np.random.default_rng(seed)
+
+    perm_up_counts = np.zeros(len(genes), dtype=float)
+    perm_down_counts = np.zeros(len(genes), dtype=float)
+
+    valid_obs = ~np.isnan(log2fc_obs) & ~np.isnan(neg_log10_p_obs)
+    obs_indices = np.where(valid_obs)[0]
+
+    # Pre-collect permuted (fc, -log10(p)) pairs for GALD-up and GALD-down directions
+    perm_up_scores = []
+    perm_down_scores = []
+
+    for _ in range(n_perm):
+        perm_idx = rng.permutation(n_total)
+        c_perm = X[:, perm_idx[:n_c]]
+        k_perm = X[:, perm_idx[n_c:]]
+
+        fc_p = np.mean(c_perm, axis=1) - np.mean(k_perm, axis=1)
+        _, p_p = ttest_ind(c_perm, k_perm, axis=1, equal_var=False, nan_policy='omit')
+        nlp_p = -np.log10(np.clip(p_p, 1e-300, 1.0))
+
+        up_mask = (~np.isnan(fc_p)) & (~np.isnan(nlp_p)) & (fc_p >= fc_cutoff)
+        down_mask = (~np.isnan(fc_p)) & (~np.isnan(nlp_p)) & (fc_p <= -fc_cutoff)
+
+        perm_up_scores.append(np.sort(nlp_p[up_mask]))
+        perm_down_scores.append(np.sort(nlp_p[down_mask]))
+
+    perm_fdr = np.ones(len(genes), dtype=float)
+
+    # Empirical FDR for GALD-enriched candidates (Log2FC >= fc_cutoff)
+    up_candidates = [
+        i for i in obs_indices
+        if log2fc_obs[i] >= fc_cutoff
+    ]
+    if up_candidates:
+        up_candidates.sort(key=lambda idx: neg_log10_p_obs[idx], reverse=True)
+        running_max_fdr = 0.0
+        for rank_idx, i in enumerate(up_candidates, start=1):
+            thresh = neg_log10_p_obs[i]
+            # Count how many permuted hits exceed thresh in each permutation
+            per_perm_hits = [
+                len(arr) - np.searchsorted(arr, thresh, side='left')
+                for arr in perm_up_scores
+            ]
+            mean_false = np.mean(per_perm_hits) if per_perm_hits else 0.0
+            fdr_est = np.clip(mean_false / rank_idx, 0.0, 1.0)
+            running_max_fdr = max(running_max_fdr, float(fdr_est))
+            perm_fdr[i] = running_max_fdr
+
+    # Empirical FDR for GALD-depleted candidates (Log2FC <= -fc_cutoff) for visual context
+    down_candidates = [
+        i for i in obs_indices
+        if log2fc_obs[i] <= -fc_cutoff
+    ]
+    if down_candidates:
+        down_candidates.sort(key=lambda idx: neg_log10_p_obs[idx], reverse=True)
+        running_max_down_fdr = 0.0
+        for rank_idx, i in enumerate(down_candidates, start=1):
+            thresh = neg_log10_p_obs[i]
+            per_perm_hits = [
+                len(arr) - np.searchsorted(arr, thresh, side='left')
+                for arr in perm_down_scores
+            ]
+            mean_false = np.mean(per_perm_hits) if per_perm_hits else 0.0
+            fdr_est = np.clip(mean_false / rank_idx, 0.0, 1.0)
+            running_max_down_fdr = max(running_max_down_fdr, float(fdr_est))
+            perm_fdr[i] = running_max_down_fdr
+
+    v_df = pd.DataFrame({
+        'Gene': genes,
+        'Log2FC': log2fc_obs,
+        'p_value': p_obs,
+        'Perm_FDR': perm_fdr,
+        'neg_log10_Perm_FDR': -np.log10(np.clip(perm_fdr, 1e-10, 1.0))
+    }).dropna(subset=['Gene', 'Log2FC', 'Perm_FDR'])
+
+    # Strictly GALD-enriched significant hits
+    sig = v_df[(v_df['Perm_FDR'] < p_cutoff) & (v_df['Log2FC'] >= fc_cutoff)].copy()
+    down = v_df[(v_df['Perm_FDR'] < p_cutoff) & (v_df['Log2FC'] <= -fc_cutoff)].copy()
+
+    top_hits = sig.sort_values(by=['Perm_FDR', 'p_value']).head(10)['Gene'].tolist()
+    hl_hits = [g for g in highlight_genes if g in sig['Gene'].values]
+
+    if pdf_obj:
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        ax.scatter(v_df['Log2FC'], v_df['neg_log10_Perm_FDR'], alpha=0.5, color='grey', s=10, zorder=1)
+        ax.scatter(sig['Log2FC'], sig['neg_log10_Perm_FDR'], alpha=0.8, color='firebrick', s=20, zorder=2)
+        ax.scatter(down['Log2FC'], down['neg_log10_Perm_FDR'], alpha=0.8, color='steelblue', s=20, zorder=2)
+
+        ax.set_title(f"{engine_name} Permutation Volcano ({n_perm} perms): {subset_name}")
+        ax.axvline(x=fc_cutoff, color='firebrick', linestyle=':', linewidth=1.5)
+        ax.axvline(x=-fc_cutoff, color='steelblue', linestyle=':', linewidth=1.5)
+        ax.axhline(y=-np.log10(p_cutoff), color='black', linestyle=':', linewidth=1.5)
+
+        for _, row in sig.iterrows():
+            if row['Gene'] not in highlight_genes:
+                ax.text(
+                    row['Log2FC'] + 0.05, row['neg_log10_Perm_FDR'], str(row['Gene']),
+                    fontsize=6, color='firebrick', va='bottom', ha='left'
+                )
+
+        for _, row in down.iterrows():
+            if row['Gene'] not in highlight_genes:
+                ax.text(
+                    row['Log2FC'] - 0.05, row['neg_log10_Perm_FDR'], str(row['Gene']),
+                    fontsize=6, color='steelblue', va='bottom', ha='right'
+                )
+
+        target_markers = ['*', '^', 'D', 's']
+        target_colors = ['gold', 'lime', 'magenta', 'cyan']
+
+        for idx, target in enumerate(highlight_genes):
+            if target in v_df['Gene'].values:
+                row = v_df[v_df['Gene'] == target].iloc[0]
+                m = target_markers[idx % len(target_markers)]
+                c = target_colors[idx % len(target_colors)]
+
+                ax.scatter(
+                    row['Log2FC'], row['neg_log10_Perm_FDR'], color=c, marker=m,
+                    s=120, edgecolor='black', linewidth=1, zorder=10
+                )
+
+                align_ha = 'left' if row['Log2FC'] >= 0 else 'right'
+                offset = 0.08 if row['Log2FC'] >= 0 else -0.08
+
+                ax.text(
+                    row['Log2FC'] + offset, row['neg_log10_Perm_FDR'], str(row['Gene']),
+                    fontsize=7, color='black', fontweight='bold', va='bottom', ha=align_ha, zorder=11
+                )
+
+        ax.set_xlabel(r'$\log_2(\text{Fold Change})$ (GALD vs Control)')
+        ax.set_ylabel(r'$-\log_{10}(\text{Permutation FDR})$')
+
+        pdf_obj.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
+
+    return sig['Gene'].tolist(), top_hits, hl_hits

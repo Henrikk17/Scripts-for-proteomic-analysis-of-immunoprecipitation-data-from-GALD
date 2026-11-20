@@ -293,7 +293,7 @@ def analyze_rf(imputed_df, s_to_g, subset_name, highlight_genes, seed, test_size
 def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight_genes, fc_thresh=0.5, p_thresh=0.05):
     """
     Paired evaluation of Liver Lysate (non-LB) vs. Lysate Buffer (LB)
-    separately within GALD and non-GALD subjects.
+    separately within GALD and non-GALD subjects, with BH-FDR adjustment.
     Uses explicit subject/donor IDs when available, falling back to the
     run-6 sample-number pairing (1..42 -> +42 -> 43..84).
     """
@@ -374,7 +374,6 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
             nongald_pairs.append((l_col, b_col))
 
     if subj_col:
-        # Pair explicitly by subject/donor ID when provided in annotation/data
         lb_by_subj = {
             str(sample_to_subj[b_col]).strip(): b_col
             for b_col in lb_cols
@@ -387,7 +386,6 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
                 if paired_lb is not None:
                     classify_cohort(l_col, paired_lb)
     else:
-        # Fallback to run-6 block pairing: 1..42 (liver) <-> +42 -> 43..84 (LB)
         lb_by_num = {extract_num(c): c for c in lb_cols if extract_num(c) is not None}
         for l_col in liver_cols:
             l_num = extract_num(l_col)
@@ -397,8 +395,10 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
                     classify_cohort(l_col, paired_lb)
 
     def run_paired_cohort(pairs):
+        empty_fdr = pd.Series(np.nan, index=wide_log2.index, dtype=float)
         if len(pairs) < 2:
-            return pd.Series(np.nan, index=wide_log2.index), pd.Series(np.nan, index=wide_log2.index)
+            return empty_fdr, empty_fdr, empty_fdr
+
         diffs = [wide_log2[l_c] - wide_log2[b_c] for l_c, b_c in pairs]
         diff_df = pd.concat(diffs, axis=1)
         mean_fc = diff_df.mean(axis=1, skipna=True)
@@ -407,12 +407,19 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
         for gene, row in diff_df.iterrows():
             vals = row.dropna().values
             if len(vals) >= 2 and np.std(vals, ddof=1) > 0:
-                _, p = ttest_1samp(vals, 0.0)
+                _, p = ttest_1samp(vals, 0.0, alternative='greater')
                 p_vals.loc[gene] = p
-        return mean_fc, p_vals
 
-    gald_fc, gald_p = run_paired_cohort(gald_pairs)
-    nongald_fc, nongald_p = run_paired_cohort(nongald_pairs)
+        fdr_vals = pd.Series(np.nan, index=wide_log2.index, dtype=float)
+        valid_p = p_vals.dropna()
+        if not valid_p.empty:
+            _, fdr_adj, _, _ = multipletests(valid_p.values, method='fdr_bh')
+            fdr_vals.loc[valid_p.index] = fdr_adj
+
+        return mean_fc, p_vals, fdr_vals
+
+    gald_fc, gald_p, gald_fdr = run_paired_cohort(gald_pairs)
+    nongald_fc, nongald_p, nongald_fdr = run_paired_cohort(nongald_pairs)
 
     classifications = {}
     records = []
@@ -420,11 +427,13 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
     for gene in wide_log2.index:
         g_fc = gald_fc.loc[gene]
         g_p = gald_p.loc[gene]
+        g_fdr = gald_fdr.loc[gene]
         ng_fc = nongald_fc.loc[gene]
         ng_p = nongald_p.loc[gene]
+        ng_fdr = nongald_fdr.loc[gene]
 
-        gald_sig_up = pd.notna(g_fc) and pd.notna(g_p) and (g_fc >= fc_thresh) and (g_p < p_thresh)
-        nongald_sig_up = pd.notna(ng_fc) and pd.notna(ng_p) and (ng_fc >= fc_thresh) and (ng_p < p_thresh)
+        gald_sig_up = pd.notna(g_fc) and pd.notna(g_fdr) and (g_fc >= fc_thresh) and (g_fdr < p_thresh)
+        nongald_sig_up = pd.notna(ng_fc) and pd.notna(ng_fdr) and (ng_fc >= fc_thresh) and (ng_fdr < p_thresh)
 
         if gald_sig_up and nongald_sig_up:
             cat = "Shared Liver Enrichment (GALD & Non-GALD)"
@@ -441,14 +450,16 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
             'Category': cat,
             'GALD_Log2FC_Liver_vs_LB': g_fc,
             'GALD_p_value': g_p,
+            'GALD_FDR': g_fdr,
             'NonGALD_Log2FC_Liver_vs_LB': ng_fc,
             'NonGALD_p_value': ng_p,
+            'NonGALD_FDR': ng_fdr,
             'GALD_Pairs_n': len(gald_pairs),
             'NonGALD_Pairs_n': len(nongald_pairs),
         })
 
     if records and out_dir is not None:
-        bg_df = pd.DataFrame(records).sort_values(by=['Category', 'GALD_p_value', 'NonGALD_p_value'])
+        bg_df = pd.DataFrame(records).sort_values(by=['Category', 'GALD_FDR', 'NonGALD_FDR', 'GALD_p_value'])
         out_path = Path(out_dir) / f"{engine_name}_Background_LB_vs_Liver_Separated.tsv"
         bg_df.to_csv(out_path, sep='\t', index=False)
 
@@ -462,8 +473,8 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
                 row_hl = bg_df[bg_df['Gene'] == hl].iloc[0]
                 print(
                     f"      * Target {hl}: {classifications[hl]} "
-                    f"(GALD FC={row_hl['GALD_Log2FC_Liver_vs_LB']:.2f}, p={row_hl['GALD_p_value']:.3g} | "
-                    f"Non-GALD FC={row_hl['NonGALD_Log2FC_Liver_vs_LB']:.2f}, p={row_hl['NonGALD_p_value']:.3g})"
+                    f"(GALD FC={row_hl['GALD_Log2FC_Liver_vs_LB']:.2f}, FDR={row_hl['GALD_FDR']:.3g}, p={row_hl['GALD_p_value']:.3g} | "
+                    f"Non-GALD FC={row_hl['NonGALD_Log2FC_Liver_vs_LB']:.2f}, FDR={row_hl['NonGALD_FDR']:.3g}, p={row_hl['NonGALD_p_value']:.3g})"
                 )
 
     return classifications

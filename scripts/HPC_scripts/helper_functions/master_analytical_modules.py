@@ -1,14 +1,15 @@
-import pandas as pd
+from pathlib import Path
+import matplotlib.pyplot as plt
 import numpy as np
-from scipy.stats import ttest_ind, fisher_exact
-from statsmodels.stats.multitest import multipletests
+import pandas as pd
+from scipy.stats import fisher_exact, ttest_1samp, ttest_ind
+import seaborn as sns
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy.stats import ttest_1samp
-from pathlib import Path
+from statsmodels.stats.multitest import multipletests
 
 
 def analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_obj, use_fdr, p_cutoff, fc_cutoff, highlight_genes):
@@ -219,27 +220,74 @@ def analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_obj, seed):
         pdf_obj.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
-def analyze_rf(imputed_df, s_to_g, subset_name, highlight_genes, seed):
-    X_sc = StandardScaler().fit_transform(imputed_df.T)
-    y_bin = np.array([1 if s_to_g[s] == 'GALD' else 0 for s in imputed_df.columns])
-    rf = RandomForestClassifier(n_estimators=300, random_state=seed, class_weight='balanced', n_jobs=-1)
-    rf.fit(X_sc, y_bin)
-    
-    imp_df = pd.DataFrame({'Gene': imputed_df.index, 'Imp': rf.feature_importances_})
-    
+def analyze_rf(imputed_df, s_to_g, subset_name, highlight_genes, seed, test_size=0.25):
+    clean_df = imputed_df.dropna(axis=0)
+    c_samps = [s for s in clean_df.columns if s_to_g[s] == 'GALD']
+    k_samps = [s for s in clean_df.columns if s_to_g[s] != 'GALD']
+
+    if clean_df.shape[0] == 0 or len(c_samps) == 0 or len(k_samps) == 0:
+        return [], [], []
+
+    y_bin = np.array([1 if s_to_g[s] == 'GALD' else 0 for s in clean_df.columns])
+    n_samples = len(y_bin)
+    class_counts = np.bincount(y_bin, minlength=2)
+    min_class_count = int(class_counts.min())
+
+    # Determine whether a stratified train/test split is possible
+    n_test = max(2, int(np.ceil(n_samples * test_size)))
+    can_split = (
+        n_samples >= 6
+        and min_class_count >= 2
+        and (n_samples - n_test) >= 2
+        and n_test < n_samples
+    )
+
+    if can_split:
+        X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+            clean_df.T.values,
+            y_bin,
+            test_size=n_test,
+            random_state=seed,
+            stratify=y_bin
+        )
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train_raw)
+        X_test = scaler.transform(X_test_raw)
+
+        rf = RandomForestClassifier(
+            n_estimators=300,
+            random_state=seed,
+            class_weight='balanced',
+            n_jobs=-1
+        )
+        rf.fit(X_train, y_train)
+        y_pred = rf.predict(X_test)
+        acc = accuracy_score(y_test, y_pred)
+        print(f"      * RF Test Accuracy [{subset_name}] (n_train={len(y_train)}, n_test={len(y_test)}): {acc:.3f} ({acc * 100:.1f}%)")
+    else:
+        X_all = StandardScaler().fit_transform(clean_df.T.values)
+        rf = RandomForestClassifier(
+            n_estimators=300,
+            random_state=seed,
+            class_weight='balanced',
+            n_jobs=-1
+        )
+        rf.fit(X_all, y_bin)
+        y_pred = rf.predict(X_all)
+        acc = accuracy_score(y_bin, y_pred)
+        print(f"      * RF Resubstitution Accuracy [{subset_name}] (too few samples for split, n={n_samples}): {acc:.3f} ({acc * 100:.1f}%)")
+
+    imp_df = pd.DataFrame({'Gene': clean_df.index, 'Imp': rf.feature_importances_})
+
     # STRICT DIRECTIONAL FILTER: Force RF to only extract targets where GALD Mean > Control Mean
-    # BOUNDARY FIX: Only check samples that actually exist in the current imputed_df subset
-    c_samps = [s for s in imputed_df.columns if s_to_g[s] == 'GALD']
-    k_samps = [s for s in imputed_df.columns if s_to_g[s] != 'GALD']
-    
-    gald_mean = imputed_df[c_samps].mean(axis=1).values
-    ctrl_mean = imputed_df[k_samps].mean(axis=1).values
-    
+    gald_mean = clean_df[c_samps].mean(axis=1).values
+    ctrl_mean = clean_df[k_samps].mean(axis=1).values
+
     imp_df['GALD_Abundant'] = gald_mean > ctrl_mean
     imp = imp_df[imp_df['GALD_Abundant']].sort_values('Imp', ascending=False).head(20)
-    
+
     hl_hits = [g for g in highlight_genes if g in imp['Gene'].values]
-    details = [f"{subset_name}(#{i+1})" for i, r in enumerate(imp.iterrows())]
+    details = [f"{subset_name}(#{i + 1})" for i in range(len(imp))]
     return details, imp['Gene'].tolist(), hl_hits
 
 def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight_genes, fc_thresh=0.5, p_thresh=0.05):
@@ -347,78 +395,6 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
                 paired_lb = lb_by_num.get(l_num + 42)
                 if paired_lb is not None:
                     classify_cohort(l_col, paired_lb)
-
-    def run_paired_cohort(pairs):
-        if len(pairs) < 2:
-            return pd.Series(np.nan, index=wide_log2.index), pd.Series(np.nan, index=wide_log2.index)
-        diffs = [wide_log2[l_c] - wide_log2[b_c] for l_c, b_c in pairs]
-        diff_df = pd.concat(diffs, axis=1)
-        mean_fc = diff_df.mean(axis=1, skipna=True)
-
-        p_vals = pd.Series(np.nan, index=wide_log2.index, dtype=float)
-        for gene, row in diff_df.iterrows():
-            vals = row.dropna().values
-            if len(vals) >= 2 and np.std(vals, ddof=1) > 0:
-                _, p = ttest_1samp(vals, 0.0)
-                p_vals.loc[gene] = p
-        return mean_fc, p_vals
-
-    gald_fc, gald_p = run_paired_cohort(gald_pairs)
-    nongald_fc, nongald_p = run_paired_cohort(nongald_pairs)
-
-    classifications = {}
-    records = []
-
-    for gene in wide_log2.index:
-        g_fc = gald_fc.loc[gene]
-        g_p = gald_p.loc[gene]
-        ng_fc = nongald_fc.loc[gene]
-        ng_p = nongald_p.loc[gene]
-
-        gald_sig_up = pd.notna(g_fc) and pd.notna(g_p) and (g_fc >= fc_thresh) and (g_p < p_thresh)
-        nongald_sig_up = pd.notna(ng_fc) and pd.notna(ng_p) and (ng_fc >= fc_thresh) and (ng_p < p_thresh)
-
-        if gald_sig_up and nongald_sig_up:
-            cat = "Shared Liver Enrichment (GALD & Non-GALD)"
-        elif gald_sig_up and not nongald_sig_up:
-            cat = "GALD-Specific Liver Enrichment"
-        elif nongald_sig_up and not gald_sig_up:
-            cat = "Non-GALD-Only Liver Enrichment"
-        else:
-            cat = "Contaminant / Carryover (Not Enriched Over LB)"
-
-        classifications[gene] = cat
-        records.append({
-            'Gene': gene,
-            'Category': cat,
-            'GALD_Log2FC_Liver_vs_LB': g_fc,
-            'GALD_p_value': g_p,
-            'NonGALD_Log2FC_Liver_vs_LB': ng_fc,
-            'NonGALD_p_value': ng_p,
-            'GALD_Pairs_n': len(gald_pairs),
-            'NonGALD_Pairs_n': len(nongald_pairs),
-        })
-
-    if records and out_dir is not None:
-        bg_df = pd.DataFrame(records).sort_values(by=['Category', 'GALD_p_value', 'NonGALD_p_value'])
-        out_path = Path(out_dir) / f"{engine_name}_Background_LB_vs_Liver_Separated.tsv"
-        bg_df.to_csv(out_path, sep='\t', index=False)
-
-        counts = bg_df['Category'].value_counts().to_dict()
-        print(f"    [{engine_name} Paired LB vs Liver (GALD n={len(gald_pairs)}, Non-GALD n={len(nongald_pairs)})]")
-        for k_cat, v_cnt in counts.items():
-            print(f"      - {k_cat}: {v_cnt}")
-
-        for hl in highlight_genes:
-            if hl in classifications:
-                row_hl = bg_df[bg_df['Gene'] == hl].iloc[0]
-                print(
-                    f"      * Target {hl}: {classifications[hl]} "
-                    f"(GALD FC={row_hl['GALD_Log2FC_Liver_vs_LB']:.2f}, p={row_hl['GALD_p_value']:.3g} | "
-                    f"Non-GALD FC={row_hl['NonGALD_Log2FC_Liver_vs_LB']:.2f}, p={row_hl['NonGALD_p_value']:.3g})"
-                )
-
-    return classifications
 
     def run_paired_cohort(pairs):
         if len(pairs) < 2:

@@ -246,6 +246,8 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
     """
     Paired evaluation of Liver Lysate (non-LB) vs. Lysate Buffer (LB)
     separately within GALD and non-GALD subjects.
+    Uses explicit subject/donor IDs when available, falling back to the
+    run-6 sample-number pairing (1..42 -> +42 -> 43..84).
     """
     if prot_with_lb is None or prot_with_lb.empty:
         return {}
@@ -263,46 +265,48 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
         return {}
 
     df_clean['Sample_str'] = df_clean['Sample'].astype(str).str.strip()
-    df_clean['Sample_num'] = pd.to_numeric(
-        df_clean['Sample_str'].str.lower().str.replace('sample_', '', regex=False).str.replace('sample', '', regex=False).str.strip(),
-        errors='coerce'
-    )
+
+    def extract_num(s_name):
+        cleaned = str(s_name).lower().replace('sample_', '').replace('sample', '').strip()
+        try:
+            return int(float(cleaned))
+        except ValueError:
+            return None
+
+    df_clean['Sample_num'] = df_clean['Sample_str'].apply(extract_num)
 
     has_group = 'Group' in df_clean.columns
-    if has_group:
-        df_clean['Group_clean'] = df_clean['Group'].astype(str).str.strip()
-    else:
-        df_clean['Group_clean'] = 'Unknown'
+    df_clean['Group_clean'] = df_clean['Group'].astype(str).str.strip() if has_group else 'Unknown'
+
+    subj_col = next(
+        (c for c in ['Subject_ID', 'Subject', 'Donor_ID', 'Donor', 'Pair_ID', 'subject_id'] if c in df_clean.columns),
+        None
+    )
 
     sample_to_group = (
         df_clean.drop_duplicates('Sample_str')
         .set_index('Sample_str')['Group_clean']
         .to_dict()
     )
-
-    def extract_num(col_name):
-        cleaned = str(col_name).lower().replace('sample_', '').replace('sample', '').strip()
-        try:
-            return int(float(cleaned))
-        except ValueError:
-            return None
+    sample_to_subj = (
+        df_clean.drop_duplicates('Sample_str')
+        .set_index('Sample_str')[subj_col]
+        .to_dict()
+        if subj_col else {}
+    )
 
     def is_lb_sample(s_name):
         low = s_name.lower()
         if '_lb' in low or 'buffer' in low or low.endswith('lb'):
             return True
         s_num = extract_num(s_name)
-        if s_num is not None:
-            return (s_num % 2 == 1) and (s_num >= 43)
-        return False
+        return s_num is not None and 43 <= s_num <= 84
 
     def is_liver_sample(s_name):
         if is_lb_sample(s_name):
             return False
         s_num = extract_num(s_name)
-        if s_num is not None:
-            return s_num >= 42
-        return True
+        return s_num is None or s_num <= 42
 
     wide_raw = df_clean.pivot_table(index='Gene', columns='Sample_str', values=quant_col, aggfunc='sum')
     wide_raw = wide_raw.where(wide_raw > 0)
@@ -311,26 +315,110 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
     liver_cols = [c for c in wide_log2.columns if is_liver_sample(c)]
     lb_cols = [c for c in wide_log2.columns if is_lb_sample(c)]
 
-    lb_by_num = {}
-    for c in lb_cols:
-        num = extract_num(c)
-        if num is not None:
-            lb_by_num[num] = c
-
     gald_pairs = []
     nongald_pairs = []
 
-    for l_col in liver_cols:
-        l_num = extract_num(l_col)
-        if l_num is None:
-            continue
-        paired_lb = lb_by_num.get(l_num + 1)
-        if paired_lb is not None:
-            grp = str(sample_to_group.get(l_col, sample_to_group.get(paired_lb, ''))).upper()
-            if 'GALD' in grp and 'NON' not in grp and 'CTRL' not in grp:
-                gald_pairs.append((l_col, paired_lb))
-            else:
-                nongald_pairs.append((l_col, paired_lb))
+    def classify_cohort(l_col, b_col):
+        grp = str(sample_to_group.get(l_col, sample_to_group.get(b_col, ''))).upper()
+        if 'GALD' in grp and 'NON' not in grp and 'CTRL' not in grp:
+            gald_pairs.append((l_col, b_col))
+        else:
+            nongald_pairs.append((l_col, b_col))
+
+    if subj_col:
+        # Pair explicitly by subject/donor ID when provided in annotation/data
+        lb_by_subj = {
+            str(sample_to_subj[b_col]).strip(): b_col
+            for b_col in lb_cols
+            if pd.notna(sample_to_subj.get(b_col)) and str(sample_to_subj.get(b_col)).strip() != ''
+        }
+        for l_col in liver_cols:
+            s_id = sample_to_subj.get(l_col)
+            if pd.notna(s_id) and str(s_id).strip() != '':
+                paired_lb = lb_by_subj.get(str(s_id).strip())
+                if paired_lb is not None:
+                    classify_cohort(l_col, paired_lb)
+    else:
+        # Fallback to run-6 block pairing: 1..42 (liver) <-> +42 -> 43..84 (LB)
+        lb_by_num = {extract_num(c): c for c in lb_cols if extract_num(c) is not None}
+        for l_col in liver_cols:
+            l_num = extract_num(l_col)
+            if l_num is not None and 1 <= l_num <= 42:
+                paired_lb = lb_by_num.get(l_num + 42)
+                if paired_lb is not None:
+                    classify_cohort(l_col, paired_lb)
+
+    def run_paired_cohort(pairs):
+        if len(pairs) < 2:
+            return pd.Series(np.nan, index=wide_log2.index), pd.Series(np.nan, index=wide_log2.index)
+        diffs = [wide_log2[l_c] - wide_log2[b_c] for l_c, b_c in pairs]
+        diff_df = pd.concat(diffs, axis=1)
+        mean_fc = diff_df.mean(axis=1, skipna=True)
+
+        p_vals = pd.Series(np.nan, index=wide_log2.index, dtype=float)
+        for gene, row in diff_df.iterrows():
+            vals = row.dropna().values
+            if len(vals) >= 2 and np.std(vals, ddof=1) > 0:
+                _, p = ttest_1samp(vals, 0.0)
+                p_vals.loc[gene] = p
+        return mean_fc, p_vals
+
+    gald_fc, gald_p = run_paired_cohort(gald_pairs)
+    nongald_fc, nongald_p = run_paired_cohort(nongald_pairs)
+
+    classifications = {}
+    records = []
+
+    for gene in wide_log2.index:
+        g_fc = gald_fc.loc[gene]
+        g_p = gald_p.loc[gene]
+        ng_fc = nongald_fc.loc[gene]
+        ng_p = nongald_p.loc[gene]
+
+        gald_sig_up = pd.notna(g_fc) and pd.notna(g_p) and (g_fc >= fc_thresh) and (g_p < p_thresh)
+        nongald_sig_up = pd.notna(ng_fc) and pd.notna(ng_p) and (ng_fc >= fc_thresh) and (ng_p < p_thresh)
+
+        if gald_sig_up and nongald_sig_up:
+            cat = "Shared Liver Enrichment (GALD & Non-GALD)"
+        elif gald_sig_up and not nongald_sig_up:
+            cat = "GALD-Specific Liver Enrichment"
+        elif nongald_sig_up and not gald_sig_up:
+            cat = "Non-GALD-Only Liver Enrichment"
+        else:
+            cat = "Contaminant / Carryover (Not Enriched Over LB)"
+
+        classifications[gene] = cat
+        records.append({
+            'Gene': gene,
+            'Category': cat,
+            'GALD_Log2FC_Liver_vs_LB': g_fc,
+            'GALD_p_value': g_p,
+            'NonGALD_Log2FC_Liver_vs_LB': ng_fc,
+            'NonGALD_p_value': ng_p,
+            'GALD_Pairs_n': len(gald_pairs),
+            'NonGALD_Pairs_n': len(nongald_pairs),
+        })
+
+    if records and out_dir is not None:
+        bg_df = pd.DataFrame(records).sort_values(by=['Category', 'GALD_p_value', 'NonGALD_p_value'])
+        out_path = Path(out_dir) / f"{engine_name}_Background_LB_vs_Liver_Separated.tsv"
+        bg_df.to_csv(out_path, sep='\t', index=False)
+
+        counts = bg_df['Category'].value_counts().to_dict()
+        print(f"    [{engine_name} Paired LB vs Liver (GALD n={len(gald_pairs)}, Non-GALD n={len(nongald_pairs)})]")
+        for k_cat, v_cnt in counts.items():
+            print(f"      - {k_cat}: {v_cnt}")
+
+        for hl in highlight_genes:
+            if hl in classifications:
+                row_hl = bg_df[bg_df['Gene'] == hl].iloc[0]
+                print(
+                    f"      * Target {hl}: {classifications[hl]} "
+                    f"(GALD FC={row_hl['GALD_Log2FC_Liver_vs_LB']:.2f}, p={row_hl['GALD_p_value']:.3g} | "
+                    f"Non-GALD FC={row_hl['NonGALD_Log2FC_Liver_vs_LB']:.2f}, p={row_hl['NonGALD_p_value']:.3g})"
+                )
+
+    return classifications
 
     def run_paired_cohort(pairs):
         if len(pairs) < 2:

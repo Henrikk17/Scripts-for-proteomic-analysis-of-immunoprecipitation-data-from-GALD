@@ -31,6 +31,8 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
     prot_file = root_path / "combined_protein.tsv"
     pep_file = root_path / "combined_peptide.tsv"
 
+    contam_pattern = r'contam|con__|^rev_'
+
     # ==========================================
     # 2. LOAD & MELT PROTEIN DATA
     # ==========================================
@@ -41,10 +43,9 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
 
     # --- Contaminant Filtering ---
     if 'Is Contaminant' in prot_df.columns:
-        prot_df = prot_df[prot_df['Is Contaminant'] == False]
+        prot_df = prot_df[prot_df['Is Contaminant'] == False] # noqa: E712
     else:
-        #print("(!) Warning: 'Is Contaminant' column not found in protein data.") #Note: this is not available in FragPipe, only for MaxQuant.
-        prot_df = prot_df[~prot_df['Protein'].str.contains("contam", na=False)] #Otherwise, some of the 
+        prot_df = prot_df[~prot_df['Protein'].astype(str).str.contains(contam_pattern, case=False, regex=True, na=False)]
 
     # --- Rename & Standardize Columns to Match MaxQuant ---
     if 'Description' in prot_df.columns and 'Protein Description' not in prot_df.columns:
@@ -128,10 +129,9 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
 
     # --- Contaminant Filtering ---
     if 'Is Contaminant' in pep_df.columns:
-        pep_df = pep_df[pep_df['Is Contaminant'] == False]
+        pep_df = pep_df[pep_df['Is Contaminant'] == False] # noqa: E712
     else:
-        #print("(!) Warning: 'Is Contaminant' column not found in peptide data.") #Again, we don't need the warning. This is deprecated. 
-        pep_df = pep_df[~pep_df['Protein'].str.contains("contam", na=False)]
+        pep_df = pep_df[~pep_df['Protein'].astype(str).str.contains(contam_pattern, case=False, regex=True, na=False)]
 
     # --- Rename & Standardize Columns to Match MaxQuant ---
     if 'Peptide' in pep_df.columns:
@@ -160,8 +160,6 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
     # --- Setup Safe ID Variables ---
     pep_id_vars_target = ['Peptide Sequence', 'Protein', 'Protein Group', 'Gene', 'Protein Name', 'Peptide Probability']
     pep_id_vars = [col for col in pep_id_vars_target if col in pep_df.columns]
-
-    
 
     # --- Melt into long format ---
     melted_pep = pep_df.melt(

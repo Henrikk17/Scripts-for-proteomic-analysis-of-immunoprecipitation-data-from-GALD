@@ -45,6 +45,32 @@ CACHE_DIR = Path("../cache_master_pipeline")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _exclude_lb_samples(pep_df):
+    """Return a copy of peptide detections excluding Lysate Buffer (LB) negative controls."""
+    if pep_df is None or pep_df.empty or 'Sample' not in pep_df.columns:
+        return pep_df
+
+    df_filt = pep_df.copy()
+    sample_str = df_filt['Sample'].astype(str).str.strip().str.lower()
+    name_lb = sample_str.str.contains(r'(?:^|_)lb$|buffer', regex=True, na=False)
+
+    s_num = pd.to_numeric(
+        sample_str.str.replace('sample_', '', regex=False).str.replace('sample', '', regex=False).str.strip(),
+        errors='coerce'
+    )
+    num_lb = s_num.between(43, 84, inclusive='both').fillna(False)
+
+    if 'Sample_type' in df_filt.columns:
+        stype = df_filt['Sample_type'].astype(str).str.strip().str.lower()
+        type_lb = stype.str.contains(r'\blb\b|buffer', regex=True, na=False)
+        lb_mask = type_lb | name_lb
+    else:
+        lb_mask = name_lb | num_lb
+
+    return df_filt[~lb_mask].copy()
+
+
 # ==========================================
 # PIPELINE EXECUTION
 # ==========================================
@@ -186,6 +212,9 @@ def compile_master_summary(mq_res, fp_res, mq_all, fp_all):
     fp_passed = get_passed_genes(fp_res)
     valid_genes = mq_passed.intersection(fp_passed)
 
+    r6_mq_pep = _exclude_lb_samples(mq_all['run6_with_LB'].get('pep'))
+    r6_fp_pep = _exclude_lb_samples(fp_all['run6_with_LB'].get('pep'))
+
     summary_rows = []
     for g in valid_genes:
         v_mq = len(mq_res['volcano_hits'].get(g, []))
@@ -203,8 +232,8 @@ def compile_master_summary(mq_res, fp_res, mq_all, fp_all):
         r5_mq = get_gald_peptide_interval(mq_all['run5_no_LB'].get('pep'), g)
         r5_fp = get_gald_peptide_interval(fp_all['run5'].get('pep'), g)
 
-        r6_mq = get_gald_peptide_interval(mq_all['run6_with_LB'].get('pep'), g)
-        r6_fp = get_gald_peptide_interval(fp_all['run6_with_LB'].get('pep'), g)
+        r6_mq = get_gald_peptide_interval(r6_mq_pep, g)
+        r6_fp = get_gald_peptide_interval(r6_fp_pep, g)
 
         pep_string = f"[MQ/FP run 4: {r4_mq}/{r4_fp}, MQ/FP run 5: {r5_mq}/{r5_fp}, MQ/FP run 6: {r6_mq}/{r6_fp}]"
 

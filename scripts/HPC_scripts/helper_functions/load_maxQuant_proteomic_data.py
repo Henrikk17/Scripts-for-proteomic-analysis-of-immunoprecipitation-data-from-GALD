@@ -131,14 +131,16 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
 
     if pep_cols:
         pep_col = pep_cols[0]
-        # Ensure it is numeric
         prot_df[pep_col] = pd.to_numeric(prot_df[pep_col], errors='coerce')
-        # Add it to the list of variables that will survive the melt
-        prot_id_vars_target = ['Protein', 'Protein Group', 'Gene', 'Description', 'Protein Name', 'Score', 'Q-value', pep_col]
+        prot_id_vars_target = [
+            'Protein', 'Protein Group', 'Gene', 'Description',
+            'Protein Name', 'Score', 'Q-value', pep_col
+        ]
     else:
-        prot_id_vars_target = ['Protein', 'Protein Group', 'Gene', 'Description', 'Protein Name', 'Score', 'Q-value']
-    # -------------------------------------
-
+        prot_id_vars_target = [
+            'Protein', 'Protein Group', 'Gene', 'Description',
+            'Protein Name', 'Score', 'Q-value'
+        ]
 
     # --- Dynamically grab MaxQuant LFQ Columns ---
     lfq_cols_prot = [c for c in prot_df.columns if c.startswith('LFQ intensity ')]
@@ -147,7 +149,6 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
         print("🚨 Warning: 'LFQ intensity' columns not found! Falling back to standard 'Intensity'.")
         lfq_cols_prot = [c for c in prot_df.columns if c.startswith('Intensity ') and not c.endswith('not normalized')]
 
-    prot_id_vars_target = ['Protein', 'Protein Group', 'Gene', 'Description', 'Protein Name', 'Score', 'Q-value']
     prot_id_vars = [col for col in prot_id_vars_target if col in prot_df.columns]
 
     melted_prot = prot_df.melt(

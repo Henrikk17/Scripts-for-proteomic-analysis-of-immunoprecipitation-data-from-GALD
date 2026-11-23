@@ -6,10 +6,12 @@ from pathlib import Path
 from helper_functions.load_maxQuant_proteomic_data import load_maxQuant_proteomic_data, find_maxquant_txt_dir
 from helper_functions.load_fragPipe_proteomic_data import load_fragPipe_proteomic_data
 
+
 def get_fragpipe_imms_datasets(cache_dir, base_dir="~/results/LFQ_MBR_IM-MS"):
     cache_file = cache_dir / "fp_imms_master_data.pkl"
     if cache_file.exists():
-        with open(cache_file, "rb") as f: return pickle.load(f)
+        with open(cache_file, "rb") as f:
+            return pickle.load(f)
 
     base_path = Path(base_dir).expanduser()
     run_specs = {
@@ -22,8 +24,9 @@ def get_fragpipe_imms_datasets(cache_dir, base_dir="~/results/LFQ_MBR_IM-MS"):
     for key, spec in run_specs.items():
         prot_df, pep_df = load_fragPipe_proteomic_data(ROOT=spec["path"], annotation_file=spec["annot"])
         prot_df = prot_df[~prot_df['Sample'].isin(['sample_14', 'sample_56'])].copy()
-        if pep_df is not None: pep_df = pep_df[~pep_df['Sample'].isin(['sample_14', 'sample_56'])].copy()
-            
+        if pep_df is not None:
+            pep_df = pep_df[~pep_df['Sample'].isin(['sample_14', 'sample_56'])].copy()
+
         if key == "run6":
             fp_data["run6_with_LB"] = {"prot": prot_df.copy(), "pep": pep_df.copy() if pep_df is not None else None}
             if 'Sample_type' in prot_df.columns:
@@ -36,28 +39,32 @@ def get_fragpipe_imms_datasets(cache_dir, base_dir="~/results/LFQ_MBR_IM-MS"):
         else:
             fp_data[key] = {"prot": prot_df, "pep": pep_df}
 
-    with open(cache_file, "wb") as f: pickle.dump(fp_data, f)
+    with open(cache_file, "wb") as f:
+        pickle.dump(fp_data, f)
     return fp_data
+
 
 def get_maxquant_datasets(cache_dir, base_dir="~/DTU-GALD"):
     cache_file = cache_dir / "mq_master_data.pkl"
     if cache_file.exists():
-        with open(cache_file, "rb") as f: return pickle.load(f)
+        with open(cache_file, "rb") as f:
+            return pickle.load(f)
 
     run_specs = {
         "run4": {"req_id": "0876", "annot": "../experiment_annotation/experiment_annotation_run4_R876.tsv"},
         "run5": {"req_id": "1101", "annot": "../experiment_annotation/experiment_annotation_run5_R1101.tsv"},
         "run6": {"req_id": "1344", "annot": "../experiment_annotation/experiment_annotation_run6_R1344.tsv"}
     }
-    
+
     mq_data = {}
     for key, spec in run_specs.items():
         txt_dir = find_maxquant_txt_dir(spec["req_id"], base_dir=base_dir)
         prot_df, pep_df = load_maxQuant_proteomic_data(ROOT=txt_dir, annotation_file=spec["annot"], load_peptides=True)
-        
+
         prot_df = prot_df[~prot_df['Sample'].isin(['sample_14', 'sample_56'])].copy()
-        if pep_df is not None: pep_df = pep_df[~pep_df['Sample'].isin(['sample_14', 'sample_56'])].copy()
-            
+        if pep_df is not None:
+            pep_df = pep_df[~pep_df['Sample'].isin(['sample_14', 'sample_56'])].copy()
+
         mq_data[f"{key}_with_LB"] = {"prot": prot_df.copy(), "pep": pep_df.copy() if pep_df is not None else None}
         if 'Sample_type' in prot_df.columns:
             mq_data[f"{key}_no_LB"] = {
@@ -67,17 +74,23 @@ def get_maxquant_datasets(cache_dir, base_dir="~/DTU-GALD"):
         else:
             mq_data[f"{key}_no_LB"] = {"prot": prot_df.copy(), "pep": pep_df.copy() if pep_df is not None else None}
 
-    with open(cache_file, "wb") as f: pickle.dump(mq_data, f)
+    with open(cache_file, "wb") as f:
+        pickle.dump(mq_data, f)
     return mq_data
 
+
 def get_gald_peptide_interval(pep_df, gene):
-    if pep_df is None or pep_df.empty: return "-"
+    if pep_df is None or pep_df.empty:
+        return "-"
     subset = pep_df[(pep_df['Gene'] == gene) & (pep_df['Group'] == 'GALD')]
-    if subset.empty: return "0"
+    if subset.empty:
+        return "0"
     counts = subset.groupby('Sample')['Peptide Sequence'].nunique()
-    if counts.empty: return "0"
+    if counts.empty:
+        return "0"
     min_c, max_c = counts.min(), counts.max()
     return str(min_c) if min_c == max_c else f"{min_c}-{max_c}"
+
 
 def build_four_subsets(prot_r4, prot_r5, prot_r6):
     return {
@@ -87,19 +100,95 @@ def build_four_subsets(prot_r4, prot_r5, prot_r6):
         "R6_GALD_vs_Spouse":  (prot_r6, "GALD", "GALD_spouse")
     }
 
-def prep_wide_df(df, group_case, group_ctrl):
-    quant_col = 'Razor Intensity' if 'Razor Intensity' in df.columns else ('MaxLFQ Intensity' if 'MaxLFQ Intensity' in df.columns else 'Intensity')
+
+def _select_representative_protein_groups(df_clean, quant_col, sample_col='Sample'):
+    """
+    Pivot at the Protein Group level (avoiding invalid summation of MaxLFQ intensities)
+    and select one representative protein group per leading Gene (most valid detections,
+    tie-broken by mean intensity).
+    """
+    if df_clean.empty:
+        return pd.DataFrame()
+
+    pg_col = (
+        'Protein Group' if 'Protein Group' in df_clean.columns
+        else ('Protein' if 'Protein' in df_clean.columns else 'Gene')
+    )
+
+    pg_wide = df_clean.pivot_table(
+        index=[pg_col, 'Gene'],
+        columns=sample_col,
+        values=quant_col,
+        aggfunc='max',
+    )
+    pg_wide = pg_wide.where(pg_wide > 0)
+
+    valid_counts = pg_wide.notna().sum(axis=1)
+    mean_int = pg_wide.mean(axis=1, skipna=True).fillna(0.0)
+
+    rank_df = pd.DataFrame({
+        'Gene': pg_wide.index.get_level_values('Gene'),
+        'valid_n': valid_counts.values,
+        'mean_int': mean_int.values,
+    }, index=pg_wide.index)
+
+    best_idx = (
+        rank_df.sort_values(by=['Gene', 'valid_n', 'mean_int'], ascending=[True, False, False])
+        .drop_duplicates(subset='Gene', keep='first')
+        .index
+    )
+
+    wide_df = pg_wide.loc[best_idx].copy()
+    wide_df.index = wide_df.index.get_level_values('Gene')
+    return wide_df
+
+
+def prep_wide_df(df, group_case, group_ctrl, min_group_frac=0.5):
+    quant_col = (
+        'Razor Intensity' if 'Razor Intensity' in df.columns
+        else ('MaxLFQ Intensity' if 'MaxLFQ Intensity' in df.columns else 'Intensity')
+    )
     df_clean = df.dropna(subset=['Gene']).copy()
     df_clean['Gene'] = df_clean['Gene'].astype(str).str.split(';').str[0].str.strip()
-    
-    s_to_g = df_clean.drop_duplicates('Sample').set_index('Sample')['Group'].astype(str).str.strip().to_dict()
+    df_clean = df_clean[df_clean['Gene'].ne('') & df_clean['Gene'].str.lower().ne('nan')]
+
+    s_to_g = (
+        df_clean.drop_duplicates('Sample')
+        .set_index('Sample')['Group']
+        .astype(str).str.strip()
+        .to_dict()
+    )
     c_samps = [s for s, g in s_to_g.items() if g == group_case]
     k_samps = [s for s, g in s_to_g.items() if g == group_ctrl]
-    
-    wide_df = df_clean.pivot_table(index='Gene', columns='Sample', values=quant_col, aggfunc='sum')
-    wide_df.replace(0, np.nan, inplace=True)
-    target_samples = [s for s in (c_samps + k_samps) if s in wide_df.columns]
-    return wide_df[target_samples].dropna(thresh=3, axis=0), [s for s in c_samps if s in target_samples], [s for s in k_samps if s in target_samples], s_to_g
+
+    wide_all = _select_representative_protein_groups(df_clean, quant_col, sample_col='Sample')
+    target_samples = [s for s in (c_samps + k_samps) if s in wide_all.columns]
+    c_valid = [s for s in c_samps if s in target_samples]
+    k_valid = [s for s in k_samps if s in target_samples]
+
+    if wide_all.empty or not target_samples:
+        empty_df = pd.DataFrame()
+        return empty_df, empty_df, c_valid, k_valid, s_to_g
+
+    # Arm 1 (Presence/Absence): keep all genes detected in at least 1 target sample
+    wide_pres = wide_all[target_samples].dropna(how='all', axis=0)
+
+    # Arm 2 (Quantitative + Perseus imputation): >= min_group_frac valid in GALD OR Control
+    min_c = max(2, int(np.ceil(len(c_valid) * min_group_frac))) if c_valid else 0
+    min_k = max(2, int(np.ceil(len(k_valid) * min_group_frac))) if k_valid else 0
+
+    c_ok = (
+        wide_pres[c_valid].notna().sum(axis=1) >= min_c
+        if c_valid else pd.Series(False, index=wide_pres.index)
+    )
+    k_ok = (
+        wide_pres[k_valid].notna().sum(axis=1) >= min_k
+        if k_valid else pd.Series(False, index=wide_pres.index)
+    )
+    wide_quant = wide_pres[c_ok | k_ok].copy()
+
+    return wide_quant, wide_pres, c_valid, k_valid, s_to_g
+
 
 def impute_perseus(wide_df, seed):
     rng = np.random.default_rng(seed)

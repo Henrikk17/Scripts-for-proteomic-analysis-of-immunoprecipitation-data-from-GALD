@@ -9,6 +9,29 @@ import warnings
 from pathlib import Path
 ####
 
+
+def _filter_contaminants_and_decoys(df, contam_pattern=r'contam|con__|^rev_'):
+    """Filter contaminants and always exclude rev_ decoys from a FragPipe table."""
+    has_contam_col = 'Is Contaminant' in df.columns
+    if has_contam_col:
+        is_contam = (
+            df['Is Contaminant']
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .isin(['true', '1', 'yes'])
+        )
+        df = df[~is_contam].copy()
+
+    if 'Protein' in df.columns:
+        pattern = r'^rev_' if has_contam_col else contam_pattern
+        df = df[
+            ~df['Protein'].astype(str).str.contains(pattern, case=False, regex=True, na=False)
+        ].copy()
+
+    return df
+
+
 def load_fragPipe_proteomic_data(ROOT, annotation_file):
     """
     Loads and processes proteomic files from the specified FragPipe root path.
@@ -20,10 +43,13 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
     # 1. LOAD ANNOTATIONS 
     # ==========================================
     annot_df = pd.read_csv(annotation_file, sep='\t')
+    for col in ['sample', 'condition', 'sample_type']:
+        if col in annot_df.columns:
+            annot_df[col] = annot_df[col].astype(str).str.strip()
     
     # Create dictionaries, ensuring no sneaky spaces exist
-    sample_to_group = dict(zip(annot_df['sample'].astype(str).str.strip(), annot_df['condition']))
-    sample_to_type = dict(zip(annot_df['sample'].astype(str).str.strip(), annot_df['sample_type']))
+    sample_to_group = dict(zip(annot_df['sample'], annot_df['condition']))
+    sample_to_type = dict(zip(annot_df['sample'], annot_df['sample_type']))
 
     print(f"Loaded annotations: Found {len(sample_to_group)} total samples in annotation file.")
 
@@ -41,11 +67,8 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
         warnings.simplefilter(action='ignore', category=pd.errors.DtypeWarning)
         prot_df = pd.read_csv(prot_file, sep='\t')
 
-    # --- Contaminant Filtering ---
-    if 'Is Contaminant' in prot_df.columns:
-        prot_df = prot_df[prot_df['Is Contaminant'] == False] # noqa: E712
-    else:
-        prot_df = prot_df[~prot_df['Protein'].astype(str).str.contains(contam_pattern, case=False, regex=True, na=False)]
+    # --- Contaminant & Decoy Filtering ---
+    prot_df = _filter_contaminants_and_decoys(prot_df, contam_pattern=contam_pattern)
 
     # --- Rename & Standardize Columns to Match MaxQuant ---
     if 'Description' in prot_df.columns and 'Protein Description' not in prot_df.columns:
@@ -102,7 +125,7 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
 
     # --- SANITY CHECK ---
     unique_mapped_samples_prot = melted_prot['Sample'].unique()
-    unique_annot_samples = annot_df['sample'].astype(str).str.strip().unique()
+    unique_annot_samples = annot_df['sample'].unique()
     missing_from_annot = set(unique_mapped_samples_prot) - set(unique_annot_samples)
     
     if len(missing_from_annot) > 0:
@@ -127,11 +150,8 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
         warnings.simplefilter(action='ignore', category=pd.errors.DtypeWarning)
         pep_df = pd.read_csv(pep_file, sep='\t')
 
-    # --- Contaminant Filtering ---
-    if 'Is Contaminant' in pep_df.columns:
-        pep_df = pep_df[pep_df['Is Contaminant'] == False] # noqa: E712
-    else:
-        pep_df = pep_df[~pep_df['Protein'].astype(str).str.contains(contam_pattern, case=False, regex=True, na=False)]
+    # --- Contaminant & Decoy Filtering ---
+    pep_df = _filter_contaminants_and_decoys(pep_df, contam_pattern=contam_pattern)
 
     # --- Rename & Standardize Columns to Match MaxQuant ---
     if 'Peptide' in pep_df.columns:

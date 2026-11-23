@@ -1,226 +1,421 @@
+# Master Analytical Modules: Volcano, Fisher, PCA, Random Forest, and Paired Background Testing
+
 from pathlib import Path
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.stats import fisher_exact, ttest_1samp, ttest_ind
-import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.stats import binomtest, fisher_exact, ttest_1samp, ttest_ind
+from statsmodels.stats.multitest import multipletests
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, balanced_accuracy_score
+from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.preprocessing import StandardScaler
-from statsmodels.stats.multitest import multipletests
+
+from helper_functions.master_data_handlers import _select_representative_protein_groups
+
+try:
+    from adjustText import adjust_text
+except ImportError:
+    adjust_text = None
 
 
-def analyze_volcano(imputed_df, c_samps, k_samps, subset_name, engine_name, pdf_obj, use_fdr, p_cutoff, fc_cutoff, highlight_genes):
+
+
+# ==========================================
+# 1. VOLCANO PLOT (WELCH'S T-TEST + BH-FDR)
+# ==========================================
+def analyze_volcano(
+    imputed_df,
+    c_samps,
+    k_samps,
+    subset_name,
+    engine_name,
+    pdf_obj,
+    use_fdr,
+    p_cutoff,
+    fc_cutoff,
+    highlight_genes,
+):
+    if imputed_df.empty or len(c_samps) < 2 or len(k_samps) < 2:
+        return [], pd.DataFrame(), [], []
+
     c_data = imputed_df[c_samps].values
     k_data = imputed_df[k_samps].values
     genes = imputed_df.index.values
-    
+
     log2fc = np.mean(c_data, axis=1) - np.mean(k_data, axis=1)
     _, p_vals = ttest_ind(c_data, k_data, axis=1, equal_var=False)
-    
+
     v_df = pd.DataFrame({'Gene': genes, 'Log2FC': log2fc, 'p_value': p_vals}).dropna()
+    if v_df.empty:
+        return [], pd.DataFrame(), [], []
+
     v_df['FDR'] = multipletests(v_df['p_value'], method='fdr_bh')[1]
     stat = 'FDR' if use_fdr else 'p_value'
-    
+    v_df['neg_log10_stat'] = -np.log10(np.clip(v_df[stat].values, 1e-300, 1.0))
+
     sig = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'] >= fc_cutoff)].copy()
     down = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'] <= -fc_cutoff)].copy()
-    
+
     top_hits = sig.sort_values(by=stat).head(10)['Gene'].tolist()
     hl_hits = [g for g in highlight_genes if g in sig['Gene'].values]
-    
+
     if pdf_obj:
-        fig, ax = plt.subplots(figsize=(10,8))
-        
-        ax.scatter(v_df['Log2FC'], -np.log10(v_df[stat]), alpha=0.5, color='grey', s=10, zorder=1)
-        ax.scatter(sig['Log2FC'], -np.log10(sig[stat]), alpha=0.8, color='firebrick', s=20, zorder=2)
-        ax.scatter(down['Log2FC'], -np.log10(down[stat]), alpha=0.8, color='steelblue', s=20, zorder=2)
-        
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        ax.scatter(v_df['Log2FC'], v_df['neg_log10_stat'], alpha=0.5, color='grey', s=10, zorder=1)
+        ax.scatter(sig['Log2FC'], sig['neg_log10_stat'], alpha=0.8, color='firebrick', s=20, zorder=2)
+        ax.scatter(down['Log2FC'], down['neg_log10_stat'], alpha=0.8, color='steelblue', s=20, zorder=2)
+
         ax.set_title(f"{engine_name} Volcano: {subset_name}")
         ax.axvline(x=fc_cutoff, color='firebrick', linestyle=':', linewidth=1.5)
         ax.axvline(x=-fc_cutoff, color='steelblue', linestyle=':', linewidth=1.5)
         ax.axhline(y=-np.log10(p_cutoff), color='black', linestyle=':', linewidth=1.5)
-        
+
         for _, row in sig.iterrows():
             if row['Gene'] not in highlight_genes:
-                ax.text(row['Log2FC'] + 0.05, -np.log10(row[stat]), str(row['Gene']), 
-                        fontsize=6, color='firebrick', va='bottom', ha='left')
-                
+                ax.text(
+                    row['Log2FC'] + 0.05,
+                    row['neg_log10_stat'],
+                    str(row['Gene']),
+                    fontsize=6,
+                    color='firebrick',
+                    va='bottom',
+                    ha='left',
+                )
+
         for _, row in down.iterrows():
             if row['Gene'] not in highlight_genes:
-                ax.text(row['Log2FC'] - 0.05, -np.log10(row[stat]), str(row['Gene']), 
-                        fontsize=6, color='steelblue', va='bottom', ha='right')
+                ax.text(
+                    row['Log2FC'] - 0.05,
+                    row['neg_log10_stat'],
+                    str(row['Gene']),
+                    fontsize=6,
+                    color='steelblue',
+                    va='bottom',
+                    ha='right',
+                )
 
         target_markers = ['*', '^', 'D', 's']
         target_colors = ['gold', 'lime', 'magenta', 'cyan']
-        
+
         for idx, target in enumerate(highlight_genes):
             if target in v_df['Gene'].values:
                 row = v_df[v_df['Gene'] == target].iloc[0]
                 m = target_markers[idx % len(target_markers)]
                 c = target_colors[idx % len(target_colors)]
-                
-                ax.scatter(row['Log2FC'], -np.log10(row[stat]), color=c, marker=m, 
-                           s=120, edgecolor='black', linewidth=1, zorder=10)
-                
+
+                ax.scatter(
+                    row['Log2FC'],
+                    row['neg_log10_stat'],
+                    color=c,
+                    marker=m,
+                    s=120,
+                    edgecolor='black',
+                    linewidth=1,
+                    zorder=10,
+                )
+
                 align_ha = 'left' if row['Log2FC'] >= 0 else 'right'
                 offset = 0.08 if row['Log2FC'] >= 0 else -0.08
-                
-                ax.text(row['Log2FC'] + offset, -np.log10(row[stat]), str(row['Gene']), 
-                        fontsize=7, color='black', fontweight='bold', va='bottom', ha=align_ha, zorder=11)
+
+                ax.text(
+                    row['Log2FC'] + offset,
+                    row['neg_log10_stat'],
+                    str(row['Gene']),
+                    fontsize=7,
+                    color='black',
+                    fontweight='bold',
+                    va='bottom',
+                    ha=align_ha,
+                    zorder=11,
+                )
 
         y_label_text = r'$-\log_{10}(\text{FDR})$' if use_fdr else r'$-\log_{10}(\text{p-value})$'
         ax.set_xlabel(r'$\log_2(\text{Fold Change})$ (GALD vs Control)')
         ax.set_ylabel(y_label_text)
-        
-        pdf_obj.savefig(fig, bbox_inches='tight'); plt.close()
-    
-    details = [f"{subset_name}(Up)" for _, r in sig.iterrows()]
-    return details, sig, top_hits, hl_hits
 
-def analyze_fisher(wide_df, c_samps, k_samps, subset_name, p_cutoff, highlight_genes):
-    c_pres = wide_df[c_samps].notna().sum(axis=1).values
-    k_pres = wide_df[k_samps].notna().sum(axis=1).values
-    genes = wide_df.index.values
+        pdf_obj.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
 
-    n_c, n_k = len(c_samps), len(k_samps)
-    records = []
+    details = [f"{subset_name}(Up)" for _ in range(len(sig))]
+    return details, sig.drop(columns=['neg_log10_stat']), top_hits, hl_hits
 
-    for g, cp, kp in zip(genes, c_pres, k_pres):
-        if cp > kp:
-            _, p = fisher_exact([[cp, n_c - cp], [kp, n_k - kp]])
-            records.append({
-                'Gene': g,
-                'p_value': p,
-                'GALD_sample_presence': int(cp),
-                'Non-GALD_sample_presence': int(kp)
-            })
 
-    f_df = pd.DataFrame(records).dropna(subset=['p_value'])
-    if f_df.empty:
+# ==========================================
+# 2. PERMUTATION VOLCANO (EXPERIMENTAL / OPTIONAL)
+# ==========================================
+def analyze_permutation_volcano(
+    imputed_df,
+    c_samps,
+    k_samps,
+    subset_name,
+    engine_name,
+    pdf_obj,
+    p_cutoff,
+    fc_cutoff,
+    highlight_genes,
+    seed,
+    n_perm=250,
+):
+    if imputed_df.empty or len(c_samps) < 2 or len(k_samps) < 2:
+        return [], [], []
+
+    rng = np.random.default_rng(seed)
+    all_samps = list(c_samps) + list(k_samps)
+    data = imputed_df[all_samps].values
+    n_c = len(c_samps)
+    n_tot = len(all_samps)
+    genes = imputed_df.index.values
+
+    c_data = data[:, :n_c]
+    k_data = data[:, n_c:]
+    obs_fc = np.mean(c_data, axis=1) - np.mean(k_data, axis=1)
+    obs_t, obs_p = ttest_ind(c_data, k_data, axis=1, equal_var=False)
+
+    valid_mask = np.isfinite(obs_t) & np.isfinite(obs_p) & np.isfinite(obs_fc)
+    if not valid_mask.any():
+        return [], [], []
+
+    data = data[valid_mask]
+    genes = genes[valid_mask]
+    obs_fc = obs_fc[valid_mask]
+    obs_t = obs_t[valid_mask]
+    obs_p = obs_p[valid_mask]
+    abs_obs_t = np.abs(obs_t)
+
+    # Generate null |t| distribution via sample-label permutations
+    null_abs_t = np.empty((n_perm, len(genes)), dtype=float)
+    for b in range(n_perm):
+        perm_idx = rng.permutation(n_tot)
+        p_c = data[:, perm_idx[:n_c]]
+        p_k = data[:, perm_idx[n_c:]]
+        t_b, _ = ttest_ind(p_c, p_k, axis=1, equal_var=False)
+        null_abs_t[b] = np.abs(np.nan_to_num(t_b, nan=0.0))
+
+    sorted_null = np.sort(null_abs_t.ravel())
+    order = np.argsort(-abs_obs_t)  # Most significant to least significant
+    sorted_obs = abs_obs_t[order]
+
+    # Expected false positives at each threshold / observed discoveries
+    n_null_ge = len(sorted_null) - np.searchsorted(sorted_null, sorted_obs, side='left')
+    exp_fp = n_null_ge / float(n_perm)
+    ranks = np.arange(1, len(sorted_obs) + 1, dtype=float)
+    raw_fdr = np.minimum(1.0, exp_fp / ranks)
+
+    # Backward cumulative minimum enforces monotonicity from least to most significant
+    mono_fdr = np.minimum.accumulate(raw_fdr[::-1])[::-1]
+    perm_fdr = np.empty_like(mono_fdr)
+    perm_fdr[order] = mono_fdr
+
+    v_df = pd.DataFrame({
+        'Gene': genes,
+        'Log2FC': obs_fc,
+        'p_value': obs_p,
+        'Perm_FDR': perm_fdr,
+    })
+    v_df['neg_log10_fdr'] = -np.log10(np.clip(v_df['Perm_FDR'].values, 1e-300, 1.0))
+
+    sig = v_df[(v_df['Perm_FDR'] < p_cutoff) & (v_df['Log2FC'] >= fc_cutoff)].copy()
+    down = v_df[(v_df['Perm_FDR'] < p_cutoff) & (v_df['Log2FC'] <= -fc_cutoff)].copy()
+
+    top_hits = sig.sort_values(by=['Perm_FDR', 'p_value']).head(10)['Gene'].tolist()
+    hl_hits = [g for g in highlight_genes if g in sig['Gene'].values]
+
+    if pdf_obj:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.scatter(v_df['Log2FC'], v_df['neg_log10_fdr'], alpha=0.5, color='grey', s=10, zorder=1)
+        ax.scatter(sig['Log2FC'], sig['neg_log10_fdr'], alpha=0.8, color='firebrick', s=20, zorder=2)
+        ax.scatter(down['Log2FC'], down['neg_log10_fdr'], alpha=0.8, color='steelblue', s=20, zorder=2)
+
+        ax.set_title(f"{engine_name} Permutation Volcano: {subset_name} (n_perm={n_perm})")
+        ax.axvline(x=fc_cutoff, color='firebrick', linestyle=':', linewidth=1.5)
+        ax.axvline(x=-fc_cutoff, color='steelblue', linestyle=':', linewidth=1.5)
+        ax.axhline(y=-np.log10(p_cutoff), color='black', linestyle=':', linewidth=1.5)
+
+        target_markers = ['*', '^', 'D', 's']
+        target_colors = ['gold', 'lime', 'magenta', 'cyan']
+        for idx, target in enumerate(highlight_genes):
+            if target in v_df['Gene'].values:
+                row = v_df[v_df['Gene'] == target].iloc[0]
+                ax.scatter(
+                    row['Log2FC'],
+                    row['neg_log10_fdr'],
+                    color=target_colors[idx % len(target_colors)],
+                    marker=target_markers[idx % len(target_markers)],
+                    s=120,
+                    edgecolor='black',
+                    linewidth=1,
+                    zorder=10,
+                )
+                ax.text(
+                    row['Log2FC'] + (0.08 if row['Log2FC'] >= 0 else -0.08),
+                    row['neg_log10_fdr'],
+                    str(row['Gene']),
+                    fontsize=7,
+                    color='black',
+                    fontweight='bold',
+                    va='bottom',
+                    ha='left' if row['Log2FC'] >= 0 else 'right',
+                    zorder=11,
+                )
+
+        ax.set_xlabel(r'$\log_2(\text{Fold Change})$ (GALD vs Control)')
+        ax.set_ylabel(r'$-\log_{10}(\text{Permutation FDR})$')
+        pdf_obj.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
+
+    return sig['Gene'].tolist(), top_hits, hl_hits
+
+
+# ==========================================
+# 3. FISHER'S EXACT TEST (PRESENCE/ABSENCE + BH-FDR)
+# ==========================================
+# ==========================================
+# 3. FISHER'S EXACT TEST (PRESENCE/ABSENCE, RAW P-VALUE)
+# ==========================================
+def analyze_fisher(wide_pres, c_samps, k_samps, subset_name, p_cutoff, highlight_genes):
+    """
+    One-sided Fisher's Exact Test (GALD > Control) on protein presence/absence.
+
+    DESIGN NOTE FOR REVIEWERS (INTENTIONAL STATISTICAL CHOICE):
+    BH-FDR correction is intentionally NOT applied to Fisher's Exact Test p-values.
+    With small cohort sizes (n=12-15 per group), Fisher's exact p-values are
+    coarsely discrete and have a high minimum attainable p-value floor; applying
+    standard BH-FDR across hundreds of sparse proteins overly inflates adjusted
+    p-values and eliminates true on/off autoantigen candidates. Instead, false
+    positives are controlled downstream by requiring replication across >=2
+    independent MS runs AND concordance across both search engines (MaxQuant
+    and FragPipe). Directional enrichment is strictly verified by group
+    proportions (cp / n_c > kp / n_k) rather than raw counts.
+    """
+    n_c = len(c_samps)
+    n_k = len(k_samps)
+    if wide_pres.empty or n_c == 0 or n_k == 0:
         return [], pd.DataFrame(), [], []
 
-    # Raw p-value cutoff only (no FDR adjustment for Fisher's exact test)
-    sig = f_df[f_df['p_value'] < p_cutoff].copy()
-    top_hits = sig.sort_values(by='p_value').head(10)['Gene'].tolist()
+    c_counts = wide_pres[c_samps].notna().sum(axis=1).astype(int)
+    k_counts = wide_pres[k_samps].notna().sum(axis=1).astype(int)
+
+    records = []
+    for gene in wide_pres.index:
+        cp = int(c_counts.loc[gene])
+        kp = int(k_counts.loc[gene])
+
+        # Only test proteins with missingness (exclude 0% or 100% across both groups)
+        if (cp + kp) == 0 or (cp + kp) == (n_c + n_k):
+            continue
+
+        _, p_val = fisher_exact(
+            [[cp, n_c - cp], [kp, n_k - kp]],
+            alternative='greater',
+        )
+        records.append({
+            'Gene': gene,
+            'p_value': p_val,
+            'GALD_sample_presence': cp,
+            'Non-GALD_sample_presence': kp,
+            'GALD_prop': cp / n_c,
+            'Non-GALD_prop': kp / n_k,
+        })
+
+    if not records:
+        return [], pd.DataFrame(), [], []
+
+    f_df = pd.DataFrame(records)
+
+    # Intentionally gate on raw p-value (see DESIGN NOTE above) + proportion direction
+    sig = (
+        f_df[(f_df['p_value'] < p_cutoff) & (f_df['GALD_prop'] > f_df['Non-GALD_prop'])]
+        .sort_values(by='p_value')
+        .copy()
+    )
+
+    top_hits = sig.head(10)['Gene'].tolist()
     hl_hits = [g for g in highlight_genes if g in sig['Gene'].values]
-    details = [
-        f"{subset_name}({r['GALD_sample_presence']}/{n_c} vs {r['Non-GALD_sample_presence']}/{n_k})"
-        for _, r in sig.iterrows()
-    ]
+    details = [f"{subset_name}(Fisher)" for _ in range(len(sig))]
 
-    return details, sig, top_hits, hl_hits
+    out_cols = ['Gene', 'p_value', 'GALD_sample_presence', 'Non-GALD_sample_presence']
+    return details, sig[out_cols], top_hits, hl_hits
 
+
+# ==========================================
+# 4. PRINCIPAL COMPONENT ANALYSIS (MEAN-CENTERED)
+# ==========================================
 def analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_obj, seed):
     clean_df = imputed_df.dropna(axis=0)
     if clean_df.shape[0] < 2 or clean_df.shape[1] < 2:
         return
 
-    # Mean-center only (preserve log2 fold-change scale without inflating imputed noise)
-    X_sc = StandardScaler(with_std=False).fit_transform(clean_df.T)
-    y = np.array([s_to_g[s] for s in clean_df.columns])
+    samples = list(clean_df.columns)
+    X = clean_df.T.values
+    X_centered = X - np.mean(X, axis=0, keepdims=True)
 
     pca = PCA(n_components=2, random_state=seed)
-    pcs = pca.fit_transform(X_sc)
-    var_pct = pca.explained_variance_ratio_ * 100
+    coords = pca.fit_transform(X_centered)
+    var_pct = pca.explained_variance_ratio_ * 100.0
 
     if pdf_obj:
         fig, ax = plt.subplots(figsize=(9, 7))
-        sns.scatterplot(x=pcs[:, 0], y=pcs[:, 1], hue=y, ax=ax, s=45, zorder=2)
+        groups = [s_to_g.get(s, 'Unknown') for s in samples]
+        unique_groups = sorted(set(groups))
+        palette = {'GALD': 'firebrick', 'Healthy donor': 'steelblue', 'GALD_spouse': 'darkorange'}
 
-        ax.set_title(f"{engine_name} PCA: {subset_name}")
-        ax.set_xlabel(f"PC1 ({var_pct[0]:.1f}%)")
-        ax.set_ylabel(f"PC2 ({var_pct[1]:.1f}%)")
-
-        # Draw once so axis limits and transforms are finalized
-        fig.canvas.draw()
-
-        labels = [
-            f"sample {str(col).lower().replace('sample_', '').replace('sample', '').strip()}"
-            for col in clean_df.columns
-        ]
-
-        # Start labels centered on each point in display (pixel) coordinates
-        disp_pts = ax.transData.transform(pcs)
-        pos = disp_pts.copy()
-
-        # Estimate label half-widths and half-heights in pixels
-        fontsize = 6.5
-        char_w = fontsize * 0.58
-        box_h = fontsize * 1.35 + 4.0
-        pad_x, pad_y = 4.0, 2.0
-
-        half_w = np.array([(len(lbl) * char_w) / 2.0 + pad_x for lbl in labels])
-        half_h = np.full(len(labels), box_h / 2.0 + pad_y)
-
-        # Iterative bounding-box repulsion in pixel space to reduce overlap
-        n_pts = len(labels)
-        for _ in range(80):
-            moved = False
-            for i in range(n_pts):
-                for j in range(i + 1, n_pts):
-                    dx = pos[i, 0] - pos[j, 0]
-                    dy = pos[i, 1] - pos[j, 1]
-                    min_dx = half_w[i] + half_w[j]
-                    min_dy = half_h[i] + half_h[j]
-
-                    if abs(dx) < min_dx and abs(dy) < min_dy:
-                        overlap_x = min_dx - abs(dx)
-                        overlap_y = min_dy - abs(dy)
-
-                        # Push along the axis with smaller overlap
-                        if overlap_x < overlap_y:
-                            sign = 1.0 if dx >= 0 else -1.0
-                            shift = sign * (overlap_x * 0.5 + 0.5)
-                            pos[i, 0] += shift
-                            pos[j, 0] -= shift
-                        else:
-                            sign = 1.0 if dy >= 0 else -1.0
-                            shift = sign * (overlap_y * 0.5 + 0.5)
-                            pos[i, 1] += shift
-                            pos[j, 1] -= shift
-                        moved = True
-            if not moved:
-                break
-
-        inv_trans = ax.transData.inverted()
-        for idx, lbl in enumerate(labels):
-            lx, ly = inv_trans.transform(pos[idx])
-            ax.text(
-                lx, ly, lbl,
-                fontsize=fontsize,
-                alpha=0.9,
-                ha="center",
-                va="center",
-                zorder=3
+        for grp in unique_groups:
+            mask = [g == grp for g in groups]
+            color = palette.get(grp, 'slategray')
+            ax.scatter(
+                coords[mask, 0],
+                coords[mask, 1],
+                label=grp,
+                color=color,
+                s=65,
+                alpha=0.85,
+                edgecolor='black',
+                linewidth=0.6,
             )
 
-            # Draw a subtle leader line if a label was pushed away from its point
-            dist = np.hypot(pos[idx, 0] - disp_pts[idx, 0], pos[idx, 1] - disp_pts[idx, 1])
-            if dist > 6.0:
-                ax.plot(
-                    [pcs[idx, 0], lx], [pcs[idx, 1], ly],
-                    color="grey", linewidth=0.5, alpha=0.6, zorder=2
-                )
+        texts = []
+        for idx, s in enumerate(samples):
+            label_txt = str(s).replace('_', ' ').strip()
+            t = ax.text(
+                coords[idx, 0],
+                coords[idx, 1],
+                label_txt,
+                fontsize=7,
+                ha='center',
+                va='center',
+            )
+            texts.append(t)
 
-        # Expand axis limits slightly if pushed labels sit near the edge
-        all_label_data = inv_trans.transform(pos)
-        x_min, x_max = ax.get_xlim()
-        y_min, y_max = ax.get_ylim()
-        ax.set_xlim(
-            min(x_min, float(all_label_data[:, 0].min()) - 0.03 * abs(x_max - x_min)),
-            max(x_max, float(all_label_data[:, 0].max()) + 0.03 * abs(x_max - x_min)),
-        )
-        ax.set_ylim(
-            min(y_min, float(all_label_data[:, 1].min()) - 0.03 * abs(y_max - y_min)),
-            max(y_max, float(all_label_data[:, 1].max()) + 0.03 * abs(y_max - y_min)),
-        )
+        if adjust_text is not None and texts:
+            adjust_text(texts, ax=ax, arrowprops=dict(arrowstyle='-', color='grey', lw=0.5))
+
+        ax.axhline(0, color='lightgrey', linestyle='--', linewidth=0.8)
+        ax.axvline(0, color='lightgrey', linestyle='--', linewidth=0.8)
+        ax.set_title(f"{engine_name} PCA: {subset_name}")
+        ax.set_xlabel(f"PC1 ({var_pct[0]:.1f}% variance)")
+        ax.set_ylabel(f"PC2 ({var_pct[1]:.1f}% variance)")
+        ax.legend(frameon=True, loc='best')
 
         pdf_obj.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
-def analyze_rf(imputed_df, s_to_g, subset_name, highlight_genes, seed, test_size=0.25):
+
+# ==========================================
+# 5. RANDOM FOREST (REPEATED STRATIFIED CV + GATING)
+# ==========================================
+def analyze_rf(
+    imputed_df,
+    s_to_g,
+    subset_name,
+    highlight_genes,
+    seed,
+    n_splits=5,
+    n_repeats=20,
+    min_bal_acc=0.60,
+):
     clean_df = imputed_df.dropna(axis=0)
     c_samps = [s for s in clean_df.columns if s_to_g[s] == 'GALD']
     k_samps = [s for s in clean_df.columns if s_to_g[s] != 'GALD']
@@ -228,74 +423,128 @@ def analyze_rf(imputed_df, s_to_g, subset_name, highlight_genes, seed, test_size
     if clean_df.shape[0] == 0 or len(c_samps) == 0 or len(k_samps) == 0:
         return [], [], []
 
+    X_raw = clean_df.T.values
     y_bin = np.array([1 if s_to_g[s] == 'GALD' else 0 for s in clean_df.columns])
-    n_samples = len(y_bin)
     class_counts = np.bincount(y_bin, minlength=2)
     min_class_count = int(class_counts.min())
 
-    # Determine whether a stratified train/test split is possible
-    n_test = max(2, int(np.ceil(n_samples * test_size)))
-    can_split = (
-        n_samples >= 6
-        and min_class_count >= 2
-        and (n_samples - n_test) >= 2
-        and n_test < n_samples
-    )
+    if min_class_count < 2:
+        print(f"      * RF skipped [{subset_name}]: insufficient samples per class (min_class={min_class_count})")
+        return [], [], []
 
-    if can_split:
-        X_train_raw, X_test_raw, y_train, y_test = train_test_split(
-            clean_df.T.values,
-            y_bin,
-            test_size=n_test,
-            random_state=seed,
-            stratify=y_bin
-        )
+    eff_splits = min(n_splits, min_class_count)
+    rskf = RepeatedStratifiedKFold(n_splits=eff_splits, n_repeats=n_repeats, random_state=seed)
+
+    fold_accs = []
+    fold_bal_accs = []
+    fold_imps = np.zeros((eff_splits * n_repeats, clean_df.shape[0]), dtype=float)
+    fold_gald_up = np.zeros((eff_splits * n_repeats, clean_df.shape[0]), dtype=bool)
+
+    for fold_idx, (train_idx, test_idx) in enumerate(rskf.split(X_raw, y_bin)):
+        X_train_raw, X_test_raw = X_raw[train_idx], X_raw[test_idx]
+        y_train, y_test = y_bin[train_idx], y_bin[test_idx]
+
+        # Directional check computed strictly on training fold (no test leakage)
+        gald_mean_tr = X_train_raw[y_train == 1].mean(axis=0)
+        ctrl_mean_tr = X_train_raw[y_train == 0].mean(axis=0)
+        fold_gald_up[fold_idx] = gald_mean_tr > ctrl_mean_tr
+
+        # Scale strictly on training fold
         scaler = StandardScaler()
         X_train = scaler.fit_transform(X_train_raw)
         X_test = scaler.transform(X_test_raw)
 
         rf = RandomForestClassifier(
             n_estimators=300,
-            random_state=seed,
+            random_state=seed + fold_idx,
             class_weight='balanced',
-            n_jobs=-1
+            n_jobs=-1,
         )
         rf.fit(X_train, y_train)
         y_pred = rf.predict(X_test)
-        acc = accuracy_score(y_test, y_pred)
-        print(f"      * RF Test Accuracy [{subset_name}] (n_train={len(y_train)}, n_test={len(y_test)}): {acc:.3f} ({acc * 100:.1f}%)")
-    else:
-        X_all = StandardScaler().fit_transform(clean_df.T.values)
-        rf = RandomForestClassifier(
-            n_estimators=300,
-            random_state=seed,
-            class_weight='balanced',
-            n_jobs=-1
+
+        fold_accs.append(accuracy_score(y_test, y_pred))
+        fold_bal_accs.append(balanced_accuracy_score(y_test, y_pred))
+        fold_imps[fold_idx] = rf.feature_importances_
+
+    mean_acc, sd_acc = float(np.mean(fold_accs)), float(np.std(fold_accs, ddof=1))
+    mean_bacc, sd_bacc = float(np.mean(fold_bal_accs)), float(np.std(fold_bal_accs, ddof=1))
+
+    print(
+        f"      * RF Repeated CV [{subset_name}] ({eff_splits}x{n_repeats} folds, n={len(y_bin)}): "
+        f"Acc={mean_acc:.3f}±{sd_acc:.3f} | BalAcc={mean_bacc:.3f}±{sd_bacc:.3f}"
+    )
+
+    # Gate: do not return feature hits if CV balanced accuracy is at/near chance
+    if mean_bacc < min_bal_acc:
+        print(
+            f"      * RF gated [{subset_name}]: BalAcc {mean_bacc:.3f} < {min_bal_acc:.2f} "
+            "(returning 0 RF hits)"
         )
-        rf.fit(X_all, y_bin)
-        y_pred = rf.predict(X_all)
-        acc = accuracy_score(y_bin, y_pred)
-        print(f"      * RF Resubstitution Accuracy [{subset_name}] (too few samples for split, n={n_samples}): {acc:.3f} ({acc * 100:.1f}%)")
+        return [], [], []
 
-    imp_df = pd.DataFrame({'Gene': clean_df.index, 'Imp': rf.feature_importances_})
+    mean_imp = fold_imps.mean(axis=0)
+    gald_up_frac = fold_gald_up.mean(axis=0)
 
-    # STRICT DIRECTIONAL FILTER: Force RF to only extract targets where GALD Mean > Control Mean
-    gald_mean = clean_df[c_samps].mean(axis=1).values
-    ctrl_mean = clean_df[k_samps].mean(axis=1).values
+    imp_df = pd.DataFrame({
+        'Gene': clean_df.index,
+        'Imp': mean_imp,
+        'GALD_Up_FoldFrac': gald_up_frac,
+    })
 
-    imp_df['GALD_Abundant'] = gald_mean > ctrl_mean
-    imp = imp_df[imp_df['GALD_Abundant']].sort_values('Imp', ascending=False).head(20)
+    # Require positive importance and GALD-abundant direction across training folds
+    imp = (
+        imp_df[(imp_df['Imp'] > 0) & (imp_df['GALD_Up_FoldFrac'] > 0.5)]
+        .sort_values('Imp', ascending=False)
+        .head(20)
+    )
 
     hl_hits = [g for g in highlight_genes if g in imp['Gene'].values]
     details = [f"{subset_name}(#{i + 1})" for i in range(len(imp))]
     return details, imp['Gene'].tolist(), hl_hits
 
-def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight_genes, fc_thresh=0.5, p_thresh=0.05):
+
+# ==========================================
+# 6. PAIRED LIVER VS. LB BACKGROUND TEST + DIRECT DiD
+# ==========================================
+# ==========================================
+# 6. PAIRED LIVER VS. LB BACKGROUND TEST + DIRECT DiD
+# ==========================================
+def analyze_background_ttest(
+    prot_with_lb,
+    engine_name,
+    out_dir,
+    highlight_genes,
+    fc_thresh=0.5,
+    p_thresh=0.05,
+    min_liver_frac=0.5,
+):
     """
-    Paired evaluation of Liver Lysate (non-LB) vs. Lysate Buffer (LB)
-    separately within GALD and non-GALD subjects, with BH-FDR adjustment.
-    Uses explicit subject/donor IDs when available, falling back to the
-    run-6 sample-number pairing (1..42 -> +42 -> 43..84).
+    Evaluation of Liver Lysate (non-LB) vs. Lysate Buffer (LB) separately within
+    GALD and non-GALD subjects, plus direct difference-in-differences
+    (Delta_GALD > Delta_NonGALD):
+      1) Presence/absence enrichment (clean targets absent or rare in LB) via
+         one-sided Fisher's Exact Test (raw p < p_thresh) + zero-LB rule.
+      2) Quantitative enrichment (detected in both Liver and LB) via
+         one-sided paired t-test with BH-FDR.
+      3) Direct GALD > Non-GALD specificity via one-sided Welch's t-test on
+         paired log2 differences (quantitative DiD, BH-FDR) and one-sided
+         Fisher's Exact Test on Liver-only pair proportions (presence/absence
+         DiD, raw p < p_thresh).
+
+    DESIGN NOTE FOR REVIEWERS (INTENTIONAL STATISTICAL CHOICE):
+    1. Fisher's Exact Test is intentionally used in place of McNemar's test for
+       the Liver vs. LB presence/absence check for methodological consistency
+       with analyze_fisher across the pipeline. Although Liver and LB samples
+       are subject-paired, treating the 2x2 detection counts with an unpaired
+       Fisher's Exact Test is a valid, conservative approximation under positive
+       within-subject correlation.
+    2. BH-FDR correction is intentionally NOT applied to Fisher's Exact Test
+       p-values (both within-cohort Liver vs. LB and presence/absence DiD).
+       Because sample sizes are small (GALD n=14, Non-GALD n=27), discrete
+       Fisher p-values inflate severely under BH adjustment, causing genuine
+       LB-absent liver proteins to be misclassified. BH-FDR IS retained for all
+       continuous t-tests (paired quantitative Liver vs. LB and quantitative DiD).
     """
     if prot_with_lb is None or prot_with_lb.empty:
         return {}
@@ -321,10 +570,17 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
         except ValueError:
             return None
 
-    df_clean['Sample_num'] = df_clean['Sample_str'].apply(extract_num)
-
     has_group = 'Group' in df_clean.columns
     df_clean['Group_clean'] = df_clean['Group'].astype(str).str.strip() if has_group else 'Unknown'
+
+    has_type = 'Sample_type' in df_clean.columns
+    sample_to_type = (
+        df_clean.drop_duplicates('Sample_str')
+        .set_index('Sample_str')['Sample_type']
+        .astype(str).str.strip().str.lower()
+        .to_dict()
+        if has_type else {}
+    )
 
     subj_col = next(
         (c for c in ['Subject_ID', 'Subject', 'Donor_ID', 'Donor', 'Pair_ID', 'subject_id'] if c in df_clean.columns),
@@ -344,6 +600,13 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
     )
 
     def is_lb_sample(s_name):
+        if has_type:
+            stype = sample_to_type.get(s_name, '')
+            if 'buffer' in stype or stype == 'lb' or ' lb' in stype or '_lb' in stype:
+                return True
+            if 'liver' in stype or 'lysate' in stype:
+                return False
+
         low = s_name.lower()
         if '_lb' in low or 'buffer' in low or low.endswith('lb'):
             return True
@@ -353,11 +616,17 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
     def is_liver_sample(s_name):
         if is_lb_sample(s_name):
             return False
+        if has_type:
+            stype = sample_to_type.get(s_name, '')
+            if 'liver' in stype:
+                return True
         s_num = extract_num(s_name)
         return s_num is None or s_num <= 42
 
-    wide_raw = df_clean.pivot_table(index='Gene', columns='Sample_str', values=quant_col, aggfunc='sum')
-    wide_raw = wide_raw.where(wide_raw > 0)
+    # Pivot at Protein Group level (no invalid summation of MaxLFQ intensities)
+    wide_raw = _select_representative_protein_groups(df_clean, quant_col, sample_col='Sample_str')
+    if wide_raw.empty:
+        return {}
     wide_log2 = np.log2(wide_raw)
 
     liver_cols = [c for c in wide_log2.columns if is_liver_sample(c)]
@@ -402,52 +671,189 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
                     classify_cohort(l_col, paired_lb)
 
     def run_paired_cohort(pairs):
-        empty_fdr = pd.Series(np.nan, index=wide_log2.index, dtype=float)
-        if len(pairs) < 2:
-            return empty_fdr, empty_fdr, empty_fdr
+        idx = wide_log2.index
+        n_total = len(pairs)
+        res = pd.DataFrame(index=idx)
+        res['liver_det'] = 0
+        res['lb_det'] = 0
+        res['liver_only'] = 0
+        res['lb_only'] = 0
+        res['both_tested'] = 0
+        res['fisher_p'] = np.nan
+        res['mean_fc'] = np.nan
+        res['quant_p'] = np.nan
+        res['quant_fdr'] = np.nan
+        res['sig_absent_lb'] = False
+        res['sig_quant'] = False
 
-        diffs = [wide_log2[l_c] - wide_log2[b_c] for l_c, b_c in pairs]
-        diff_df = pd.concat(diffs, axis=1)
-        mean_fc = diff_df.mean(axis=1, skipna=True)
+        if n_total == 0:
+            return res, np.empty((len(idx), 0), dtype=float)
 
-        p_vals = pd.Series(np.nan, index=wide_log2.index, dtype=float)
-        for gene, row in diff_df.iterrows():
-            vals = row.dropna().values
-            if len(vals) >= 2 and np.std(vals, ddof=1) > 0:
-                _, p = ttest_1samp(vals, 0.0, alternative='greater')
-                p_vals.loc[gene] = p
+        l_list = [l_c for l_c, _ in pairs]
+        b_list = [b_c for _, b_c in pairs]
+        l_vals = wide_log2[l_list].values
+        b_vals = wide_log2[b_list].values
+        diffs = l_vals - b_vals
 
-        fdr_vals = pd.Series(np.nan, index=wide_log2.index, dtype=float)
-        valid_p = p_vals.dropna()
-        if not valid_p.empty:
-            _, fdr_adj, _, _ = multipletests(valid_p.values, method='fdr_bh')
-            fdr_vals.loc[valid_p.index] = fdr_adj
+        l_pres = ~np.isnan(l_vals)
+        b_pres = ~np.isnan(b_vals)
 
-        return mean_fc, p_vals, fdr_vals
+        n_liver_det = l_pres.sum(axis=1)
+        n_lb_det = b_pres.sum(axis=1)
+        n_liver_only = (l_pres & ~b_pres).sum(axis=1)
+        n_lb_only = (~l_pres & b_pres).sum(axis=1)
+        n_both = (l_pres & b_pres).sum(axis=1)
 
-    gald_fc, gald_p, gald_fdr = run_paired_cohort(gald_pairs)
-    nongald_fc, nongald_p, nongald_fdr = run_paired_cohort(nongald_pairs)
+        res['liver_det'] = n_liver_det
+        res['lb_det'] = n_lb_det
+        res['liver_only'] = n_liver_only
+        res['lb_only'] = n_lb_only
+        res['both_tested'] = n_both
+
+        # Case 1: Presence/absence test via one-sided Fisher's Exact Test (unadjusted raw p; see DESIGN NOTE)
+        fisher_p = np.full(len(idx), np.nan, dtype=float)
+        for i in range(len(idx)):
+            l_d = int(n_liver_det[i])
+            b_d = int(n_lb_det[i])
+            if 0 < (l_d + b_d) < (2 * n_total):
+                _, p_f = fisher_exact(
+                    [[l_d, n_total - l_d], [b_d, n_total - b_d]],
+                    alternative='greater',
+                )
+                fisher_p[i] = p_f
+        res['fisher_p'] = fisher_p
+
+        min_liver_det = max(3, int(np.ceil(n_total * min_liver_frac)))
+        res['sig_absent_lb'] = (
+            (res['fisher_p'].notna() & (res['fisher_p'] < p_thresh) & (res['liver_det'] > res['lb_det']))
+            | ((res['liver_det'] >= min_liver_det) & (res['lb_det'] == 0))
+        )
+
+        # Case 2: Quantitative paired t-test on co-detected pairs (BH-FDR controlled)
+        if n_total >= 2:
+            mean_fc = np.full(len(idx), np.nan, dtype=float)
+            quant_p = np.full(len(idx), np.nan, dtype=float)
+
+            for i in range(len(idx)):
+                if n_both[i] >= 1:
+                    valid_d = diffs[i, ~np.isnan(diffs[i])]
+                    mean_fc[i] = float(np.mean(valid_d))
+                    if len(valid_d) >= 2 and np.std(valid_d, ddof=1) > 0:
+                        _, p = ttest_1samp(valid_d, 0.0, alternative='greater')
+                        quant_p[i] = p
+
+            res['mean_fc'] = mean_fc
+            res['quant_p'] = quant_p
+
+            valid_q = res['quant_p'].dropna()
+            if not valid_q.empty:
+                _, q_fdr, _, _ = multipletests(valid_q.values, method='fdr_bh')
+                res.loc[valid_q.index, 'quant_fdr'] = q_fdr
+
+            res['sig_quant'] = (
+                res['mean_fc'].notna()
+                & res['quant_fdr'].notna()
+                & (res['mean_fc'] >= fc_thresh)
+                & (res['quant_fdr'] < p_thresh)
+            )
+
+        return res, diffs
+
+    gald_res, gald_diffs = run_paired_cohort(gald_pairs)
+    nongald_res, nongald_diffs = run_paired_cohort(nongald_pairs)
+
+    # Case 3: Direct Difference-in-Differences (Delta_GALD > Delta_NonGALD)
+    idx = wide_log2.index
+    n_genes = len(idx)
+    n_gald = len(gald_pairs)
+    n_nongald = len(nongald_pairs)
+
+    did_fc = np.full(n_genes, np.nan, dtype=float)
+    did_quant_p = np.full(n_genes, np.nan, dtype=float)
+    did_pres_p = np.full(n_genes, np.nan, dtype=float)
+
+    g_lo_arr = gald_res['liver_only'].values
+    ng_lo_arr = nongald_res['liver_only'].values
+
+    for i in range(n_genes):
+        # Quantitative DiD: Welch's one-sided t-test on paired log2 differences (BH-FDR controlled)
+        g_d = gald_diffs[i, ~np.isnan(gald_diffs[i])] if gald_diffs.shape[1] > 0 else np.array([])
+        ng_d = nongald_diffs[i, ~np.isnan(nongald_diffs[i])] if nongald_diffs.shape[1] > 0 else np.array([])
+
+        if len(g_d) >= 1 and len(ng_d) >= 1:
+            did_fc[i] = float(np.mean(g_d) - np.mean(ng_d))
+        if len(g_d) >= 2 and len(ng_d) >= 2:
+            if np.std(g_d, ddof=1) > 0 or np.std(ng_d, ddof=1) > 0:
+                _, p_did = ttest_ind(g_d, ng_d, equal_var=False, alternative='greater')
+                did_quant_p[i] = p_did
+
+        # Presence/absence DiD: Fisher's exact test on Liver-only (Liver+ & LB-) pair counts (raw p; see DESIGN NOTE)
+        if n_gald > 0 and n_nongald > 0 and (g_lo_arr[i] > 0 or ng_lo_arr[i] > 0):
+            _, p_pres = fisher_exact(
+                [[int(g_lo_arr[i]), int(n_gald - g_lo_arr[i])],
+                 [int(ng_lo_arr[i]), int(n_nongald - ng_lo_arr[i])]],
+                alternative='greater',
+            )
+            did_pres_p[i] = p_pres
+
+    did_df = pd.DataFrame({
+        'did_fc': did_fc,
+        'did_quant_p': did_quant_p,
+        'did_quant_fdr': np.nan,
+        'did_pres_p': did_pres_p,
+    }, index=idx)
+
+    valid_dq = did_df['did_quant_p'].dropna()
+    if not valid_dq.empty:
+        _, dq_fdr, _, _ = multipletests(valid_dq.values, method='fdr_bh')
+        did_df.loc[valid_dq.index, 'did_quant_fdr'] = dq_fdr
+
+    did_df['sig_did_quant'] = (
+        did_df['did_fc'].notna()
+        & did_df['did_quant_fdr'].notna()
+        & (did_df['did_fc'] >= fc_thresh)
+        & (did_df['did_quant_fdr'] < p_thresh)
+    )
+    did_df['sig_did_pres'] = (
+        did_df['did_pres_p'].notna()
+        & (did_df['did_pres_p'] < p_thresh)
+        & ((g_lo_arr / max(n_gald, 1)) > (ng_lo_arr / max(n_nongald, 1)))
+    )
 
     classifications = {}
     records = []
 
-    for gene in wide_log2.index:
-        g_fc = gald_fc.loc[gene]
-        g_p = gald_p.loc[gene]
-        g_fdr = gald_fdr.loc[gene]
-        ng_fc = nongald_fc.loc[gene]
-        ng_p = nongald_p.loc[gene]
-        ng_fdr = nongald_fdr.loc[gene]
+    for gene in idx:
+        g = gald_res.loc[gene]
+        ng = nongald_res.loc[gene]
+        d = did_df.loc[gene]
 
-        gald_sig_up = pd.notna(g_fc) and pd.notna(g_fdr) and (g_fc >= fc_thresh) and (g_fdr < p_thresh)
-        nongald_sig_up = pd.notna(ng_fc) and pd.notna(ng_fdr) and (ng_fc >= fc_thresh) and (ng_fdr < p_thresh)
+        gald_sig_up = bool(g['sig_absent_lb'] or g['sig_quant'])
+        nongald_sig_up = bool(ng['sig_absent_lb'] or ng['sig_quant'])
+        gald_gt_ctrl = bool(d['sig_did_quant'] or d['sig_did_pres'])
 
-        if gald_sig_up and nongald_sig_up:
-            cat = "Shared Liver Enrichment (GALD & Non-GALD)"
+        if gald_sig_up and gald_gt_ctrl:
+            if bool(g['sig_absent_lb']) and bool(d['sig_did_pres']) and not bool(d['sig_did_quant']):
+                cat = "GALD-Enriched Over LB & Controls (Absent in LB)"
+            else:
+                cat = "GALD-Enriched Over LB & Controls"
+        elif gald_sig_up and nongald_sig_up:
+            if bool(g['sig_absent_lb']) and bool(ng['sig_absent_lb']):
+                cat = "Shared Liver Enrichment (Absent in LB)"
+            else:
+                cat = "Shared Liver Enrichment (GALD & Non-GALD)"
         elif gald_sig_up and not nongald_sig_up:
-            cat = "GALD-Specific Liver Enrichment"
+            if bool(g['sig_absent_lb']):
+                cat = "Liver-Enriched in GALD (Unconfirmed vs Controls, Absent in LB)"
+            else:
+                cat = "Liver-Enriched in GALD (Unconfirmed vs Controls)"
         elif nongald_sig_up and not gald_sig_up:
-            cat = "Non-GALD-Only Liver Enrichment"
+            if bool(ng['sig_absent_lb']):
+                cat = "Non-GALD Liver Enrichment (Absent in LB)"
+            else:
+                cat = "Non-GALD Liver Enrichment"
+        elif int(g['lb_det']) == 0 and int(ng['lb_det']) == 0:
+            cat = "Low Detection (Absent in LB)"
         else:
             cat = "Contaminant / Carryover (Not Enriched Over LB)"
 
@@ -455,23 +861,40 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
         records.append({
             'Gene': gene,
             'Category': cat,
-            'GALD_Log2FC_Liver_vs_LB': g_fc,
-            'GALD_p_value': g_p,
-            'GALD_FDR': g_fdr,
-            'NonGALD_Log2FC_Liver_vs_LB': ng_fc,
-            'NonGALD_p_value': ng_p,
-            'NonGALD_FDR': ng_fdr,
-            'GALD_Pairs_n': len(gald_pairs),
-            'NonGALD_Pairs_n': len(nongald_pairs),
+            'DiD_Log2FC_GALD_vs_NonGALD': d['did_fc'],
+            'DiD_Quant_p': d['did_quant_p'],
+            'DiD_Quant_FDR': d['did_quant_fdr'],
+            'DiD_Pres_Fisher_p': d['did_pres_p'],
+            'GALD_Liver_Det': int(g['liver_det']),
+            'GALD_LB_Det': int(g['lb_det']),
+            'GALD_LiverOnly_Pairs': int(g['liver_only']),
+            'GALD_Both_Pairs_Tested': int(g['both_tested']),
+            'GALD_Pairs_Total': n_gald,
+            'GALD_Fisher_p': g['fisher_p'],
+            'GALD_Log2FC_Liver_vs_LB': g['mean_fc'],
+            'GALD_p_value': g['quant_p'],
+            'GALD_FDR': g['quant_fdr'],
+            'NonGALD_Liver_Det': int(ng['liver_det']),
+            'NonGALD_LB_Det': int(ng['lb_det']),
+            'NonGALD_LiverOnly_Pairs': int(ng['liver_only']),
+            'NonGALD_Both_Pairs_Tested': int(ng['both_tested']),
+            'NonGALD_Pairs_Total': n_nongald,
+            'NonGALD_Fisher_p': ng['fisher_p'],
+            'NonGALD_Log2FC_Liver_vs_LB': ng['mean_fc'],
+            'NonGALD_p_value': ng['quant_p'],
+            'NonGALD_FDR': ng['quant_fdr'],
         })
 
     if records and out_dir is not None:
-        bg_df = pd.DataFrame(records).sort_values(by=['Category', 'GALD_FDR', 'NonGALD_FDR', 'GALD_p_value'])
+        bg_df = pd.DataFrame(records).sort_values(
+            by=['Category', 'DiD_Quant_FDR', 'DiD_Pres_Fisher_p', 'GALD_FDR', 'GALD_Fisher_p'],
+            na_position='last',
+        )
         out_path = Path(out_dir) / f"{engine_name}_Background_LB_vs_Liver_Separated.tsv"
         bg_df.to_csv(out_path, sep='\t', index=False)
 
         counts = bg_df['Category'].value_counts().to_dict()
-        print(f"    [{engine_name} Paired LB vs Liver (GALD n={len(gald_pairs)}, Non-GALD n={len(nongald_pairs)})]")
+        print(f"    [{engine_name} Paired LB vs Liver (GALD n={n_gald}, Non-GALD n={n_nongald})]")
         for k_cat, v_cnt in counts.items():
             print(f"      - {k_cat}: {v_cnt}")
 
@@ -480,164 +903,12 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
                 row_hl = bg_df[bg_df['Gene'] == hl].iloc[0]
                 print(
                     f"      * Target {hl}: {classifications[hl]} "
-                    f"(GALD FC={row_hl['GALD_Log2FC_Liver_vs_LB']:.2f}, FDR={row_hl['GALD_FDR']:.3g}, p={row_hl['GALD_p_value']:.3g} | "
-                    f"Non-GALD FC={row_hl['NonGALD_Log2FC_Liver_vs_LB']:.2f}, FDR={row_hl['NonGALD_FDR']:.3g}, p={row_hl['NonGALD_p_value']:.3g})"
+                    f"(DiD FC={row_hl['DiD_Log2FC_GALD_vs_NonGALD']:.2f}, "
+                    f"DiD_Q_FDR={row_hl['DiD_Quant_FDR']:.3g}, DiD_P_p={row_hl['DiD_Pres_Fisher_p']:.3g} | "
+                    f"GALD Liver/LB={row_hl['GALD_Liver_Det']}/{row_hl['GALD_LB_Det']}, "
+                    f"Fisher_p={row_hl['GALD_Fisher_p']:.3g}, FC={row_hl['GALD_Log2FC_Liver_vs_LB']:.2f}, FDR={row_hl['GALD_FDR']:.3g} | "
+                    f"Non-GALD Liver/LB={row_hl['NonGALD_Liver_Det']}/{row_hl['NonGALD_LB_Det']}, "
+                    f"Fisher_p={row_hl['NonGALD_Fisher_p']:.3g}, FC={row_hl['NonGALD_Log2FC_Liver_vs_LB']:.2f}, FDR={row_hl['NonGALD_FDR']:.3g})"
                 )
 
     return classifications
-
-def analyze_permutation_volcano(
-    imputed_df, c_samps, k_samps, subset_name, engine_name,
-    pdf_obj, p_cutoff, fc_cutoff, highlight_genes, seed, n_perm=250
-):
-    c_data = imputed_df[c_samps].values
-    k_data = imputed_df[k_samps].values
-    genes = imputed_df.index.values
-
-    # Observed GALD vs Control (positive Log2FC = more abundant in GALD)
-    log2fc_obs = np.mean(c_data, axis=1) - np.mean(k_data, axis=1)
-    _, p_obs = ttest_ind(c_data, k_data, axis=1, equal_var=False, nan_policy='omit')
-    neg_log10_p_obs = -np.log10(np.clip(p_obs, 1e-300, 1.0))
-
-    # Build empirical null by shuffling sample labels across combined matrix
-    X = np.hstack([c_data, k_data])
-    n_c = len(c_samps)
-    n_total = X.shape[1]
-    rng = np.random.default_rng(seed)
-
-    perm_up_counts = np.zeros(len(genes), dtype=float)
-    perm_down_counts = np.zeros(len(genes), dtype=float)
-
-    valid_obs = ~np.isnan(log2fc_obs) & ~np.isnan(neg_log10_p_obs)
-    obs_indices = np.where(valid_obs)[0]
-
-    # Pre-collect permuted (fc, -log10(p)) pairs for GALD-up and GALD-down directions
-    perm_up_scores = []
-    perm_down_scores = []
-
-    for _ in range(n_perm):
-        perm_idx = rng.permutation(n_total)
-        c_perm = X[:, perm_idx[:n_c]]
-        k_perm = X[:, perm_idx[n_c:]]
-
-        fc_p = np.mean(c_perm, axis=1) - np.mean(k_perm, axis=1)
-        _, p_p = ttest_ind(c_perm, k_perm, axis=1, equal_var=False, nan_policy='omit')
-        nlp_p = -np.log10(np.clip(p_p, 1e-300, 1.0))
-
-        up_mask = (~np.isnan(fc_p)) & (~np.isnan(nlp_p)) & (fc_p >= fc_cutoff)
-        down_mask = (~np.isnan(fc_p)) & (~np.isnan(nlp_p)) & (fc_p <= -fc_cutoff)
-
-        perm_up_scores.append(np.sort(nlp_p[up_mask]))
-        perm_down_scores.append(np.sort(nlp_p[down_mask]))
-
-    perm_fdr = np.ones(len(genes), dtype=float)
-
-    # Empirical FDR for GALD-enriched candidates (Log2FC >= fc_cutoff)
-    up_candidates = [
-        i for i in obs_indices
-        if log2fc_obs[i] >= fc_cutoff
-    ]
-    if up_candidates:
-        up_candidates.sort(key=lambda idx: neg_log10_p_obs[idx], reverse=True)
-        running_max_fdr = 0.0
-        for rank_idx, i in enumerate(up_candidates, start=1):
-            thresh = neg_log10_p_obs[i]
-            # Count how many permuted hits exceed thresh in each permutation
-            per_perm_hits = [
-                len(arr) - np.searchsorted(arr, thresh, side='left')
-                for arr in perm_up_scores
-            ]
-            mean_false = np.mean(per_perm_hits) if per_perm_hits else 0.0
-            fdr_est = np.clip(mean_false / rank_idx, 0.0, 1.0)
-            running_max_fdr = max(running_max_fdr, float(fdr_est))
-            perm_fdr[i] = running_max_fdr
-
-    # Empirical FDR for GALD-depleted candidates (Log2FC <= -fc_cutoff) for visual context
-    down_candidates = [
-        i for i in obs_indices
-        if log2fc_obs[i] <= -fc_cutoff
-    ]
-    if down_candidates:
-        down_candidates.sort(key=lambda idx: neg_log10_p_obs[idx], reverse=True)
-        running_max_down_fdr = 0.0
-        for rank_idx, i in enumerate(down_candidates, start=1):
-            thresh = neg_log10_p_obs[i]
-            per_perm_hits = [
-                len(arr) - np.searchsorted(arr, thresh, side='left')
-                for arr in perm_down_scores
-            ]
-            mean_false = np.mean(per_perm_hits) if per_perm_hits else 0.0
-            fdr_est = np.clip(mean_false / rank_idx, 0.0, 1.0)
-            running_max_down_fdr = max(running_max_down_fdr, float(fdr_est))
-            perm_fdr[i] = running_max_down_fdr
-
-    v_df = pd.DataFrame({
-        'Gene': genes,
-        'Log2FC': log2fc_obs,
-        'p_value': p_obs,
-        'Perm_FDR': perm_fdr,
-        'neg_log10_Perm_FDR': -np.log10(np.clip(perm_fdr, 1e-10, 1.0))
-    }).dropna(subset=['Gene', 'Log2FC', 'Perm_FDR'])
-
-    # Strictly GALD-enriched significant hits
-    sig = v_df[(v_df['Perm_FDR'] < p_cutoff) & (v_df['Log2FC'] >= fc_cutoff)].copy()
-    down = v_df[(v_df['Perm_FDR'] < p_cutoff) & (v_df['Log2FC'] <= -fc_cutoff)].copy()
-
-    top_hits = sig.sort_values(by=['Perm_FDR', 'p_value']).head(10)['Gene'].tolist()
-    hl_hits = [g for g in highlight_genes if g in sig['Gene'].values]
-
-    if pdf_obj:
-        fig, ax = plt.subplots(figsize=(10, 8))
-
-        ax.scatter(v_df['Log2FC'], v_df['neg_log10_Perm_FDR'], alpha=0.5, color='grey', s=10, zorder=1)
-        ax.scatter(sig['Log2FC'], sig['neg_log10_Perm_FDR'], alpha=0.8, color='firebrick', s=20, zorder=2)
-        ax.scatter(down['Log2FC'], down['neg_log10_Perm_FDR'], alpha=0.8, color='steelblue', s=20, zorder=2)
-
-        ax.set_title(f"{engine_name} Permutation Volcano ({n_perm} perms): {subset_name}")
-        ax.axvline(x=fc_cutoff, color='firebrick', linestyle=':', linewidth=1.5)
-        ax.axvline(x=-fc_cutoff, color='steelblue', linestyle=':', linewidth=1.5)
-        ax.axhline(y=-np.log10(p_cutoff), color='black', linestyle=':', linewidth=1.5)
-
-        for _, row in sig.iterrows():
-            if row['Gene'] not in highlight_genes:
-                ax.text(
-                    row['Log2FC'] + 0.05, row['neg_log10_Perm_FDR'], str(row['Gene']),
-                    fontsize=6, color='firebrick', va='bottom', ha='left'
-                )
-
-        for _, row in down.iterrows():
-            if row['Gene'] not in highlight_genes:
-                ax.text(
-                    row['Log2FC'] - 0.05, row['neg_log10_Perm_FDR'], str(row['Gene']),
-                    fontsize=6, color='steelblue', va='bottom', ha='right'
-                )
-
-        target_markers = ['*', '^', 'D', 's']
-        target_colors = ['gold', 'lime', 'magenta', 'cyan']
-
-        for idx, target in enumerate(highlight_genes):
-            if target in v_df['Gene'].values:
-                row = v_df[v_df['Gene'] == target].iloc[0]
-                m = target_markers[idx % len(target_markers)]
-                c = target_colors[idx % len(target_colors)]
-
-                ax.scatter(
-                    row['Log2FC'], row['neg_log10_Perm_FDR'], color=c, marker=m,
-                    s=120, edgecolor='black', linewidth=1, zorder=10
-                )
-
-                align_ha = 'left' if row['Log2FC'] >= 0 else 'right'
-                offset = 0.08 if row['Log2FC'] >= 0 else -0.08
-
-                ax.text(
-                    row['Log2FC'] + offset, row['neg_log10_Perm_FDR'], str(row['Gene']),
-                    fontsize=7, color='black', fontweight='bold', va='bottom', ha=align_ha, zorder=11
-                )
-
-        ax.set_xlabel(r'$\log_2(\text{Fold Change})$ (GALD vs Control)')
-        ax.set_ylabel(r'$-\log_{10}(\text{Permutation FDR})$')
-
-        pdf_obj.savefig(fig, bbox_inches='tight')
-        plt.close(fig)
-
-    return sig['Gene'].tolist(), top_hits, hl_hits

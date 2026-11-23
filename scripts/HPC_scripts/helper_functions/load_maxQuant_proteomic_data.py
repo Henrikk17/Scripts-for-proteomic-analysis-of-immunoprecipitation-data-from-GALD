@@ -33,23 +33,26 @@ def find_maxquant_txt_dir(run_id_num, base_dir="~/DTU-GALD"):
         f"❌ Could not find 'proteinGroups.txt' for {padded_id} inside {base_path}"
     )
 
+def _extract_sample_id(col_or_series):
+    """
+    Extract canonical 'sample_<N>' from MaxQuant intensity headers
+    (e.g., 'LFQ intensity Sample_14_...' or 'LFQ intensity 14_...').
+    Accepts either a single header string or a pandas Series.
+    """
+    def _parse_one(val):
+        s = str(val).strip()
+        m = re.search(r'sample[_\s-]*(\d+)', s, flags=re.IGNORECASE)
+        if m:
+            return f"sample_{int(m.group(1))}"
+        stripped = re.sub(r'^(?:LFQ\s+)?intensity\s+', '', s, flags=re.IGNORECASE).strip()
+        m_num = re.search(r'(\d+)', stripped)
+        if m_num:
+            return f"sample_{int(m_num.group(1))}"
+        return stripped.lower()
 
-def _extract_sample_id(raw_col_series):
-    """
-    Robustly extracts 'sample_<N>' from MaxQuant column headers like:
-      'LFQ intensity 1_S3-A1_1_9338' -> 'sample_1'
-      'LFQ intensity S1_...'         -> 'sample_1'
-      'LFQ intensity Sample_14_...'  -> 'sample_14'
-    """
-    cleaned = (
-        raw_col_series
-        .str.replace('LFQ intensity ', '', regex=False)
-        .str.replace('Intensity ', '', regex=False)
-        .str.strip()
-    )
-    first_token = cleaned.str.split('_', n=1).str[0]
-    sample_nums = first_token.str.extract(r'(\d+)', expand=False)
-    return 'sample_' + sample_nums.astype(int).astype(str)
+    if isinstance(col_or_series, pd.Series):
+        return col_or_series.map(_parse_one)
+    return _parse_one(col_or_series)
 
 
 def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
@@ -121,17 +124,24 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
         )
 
     # ---> INJECTED PEPTIDE EXTRACTION <---
-    # Explicitly target the high-confidence Razor/Unique peptide count
-    target_pep_cols = ['Peptide counts (razor+unique)', 'Razor + unique peptides', 'Peptides']
-    pep_cols = [c for c in prot_df.columns if c in target_pep_cols]
+    # Prioritize scalar peptide count columns over semicolon-delimited protein-group counts
+    target_pep_cols = ['Razor + unique peptides', 'Peptides', 'Peptide counts (razor+unique)']
+    pep_cols = [c for c in target_pep_cols if c in prot_df.columns]
 
     # Fallback if exact names aren't found
     if not pep_cols:
-        pep_cols = [c for c in prot_df.columns if 'peptide' in c.lower() and ('count' in c.lower() or 'razor' in c.lower())]
+        pep_cols = [
+            c for c in prot_df.columns
+            if 'peptide' in c.lower() and ('count' in c.lower() or 'razor' in c.lower())
+        ]
 
     if pep_cols:
         pep_col = pep_cols[0]
-        prot_df[pep_col] = pd.to_numeric(prot_df[pep_col], errors='coerce')
+        # Handle semicolon-delimited values (e.g. "12;12;5") safely before numeric conversion
+        prot_df[pep_col] = pd.to_numeric(
+            prot_df[pep_col].astype(str).str.split(';').str[0].str.strip(),
+            errors='coerce'
+        )
         prot_id_vars_target = [
             'Protein', 'Protein Group', 'Gene', 'Description',
             'Protein Name', 'Score', 'Q-value', pep_col
@@ -141,13 +151,17 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
             'Protein', 'Protein Group', 'Gene', 'Description',
             'Protein Name', 'Score', 'Q-value'
         ]
+    # -------------------------------------
 
     # --- Dynamically grab MaxQuant LFQ Columns ---
     lfq_cols_prot = [c for c in prot_df.columns if c.startswith('LFQ intensity ')]
 
     if not lfq_cols_prot:
         print("🚨 Warning: 'LFQ intensity' columns not found! Falling back to standard 'Intensity'.")
-        lfq_cols_prot = [c for c in prot_df.columns if c.startswith('Intensity ') and not c.endswith('not normalized')]
+        lfq_cols_prot = [
+            c for c in prot_df.columns
+            if c.startswith('Intensity ') and not c.endswith('not normalized')
+        ]
 
     prot_id_vars = [col for col in prot_id_vars_target if col in prot_df.columns]
 

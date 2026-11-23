@@ -75,6 +75,8 @@ def _exclude_lb_samples(pep_df):
     return df_filt[~lb_mask].copy()
 
 
+EXCLUDED_SAMPLES = ['sample_14', 'sample_56']
+
 def _load_fp_no_mbr_r6_prot():
     """Load run 6 no-MBR FragPipe protein detections strictly for background testing."""
     if not FP_NO_MBR_R6_DIR.exists():
@@ -85,6 +87,8 @@ def _load_fp_no_mbr_r6_prot():
         return None
 
     prot_no_mbr, _ = load_fragPipe_proteomic_data(FP_NO_MBR_R6_DIR, RUN6_ANNOT_FILE)
+    if prot_no_mbr is not None and 'Sample' in prot_no_mbr.columns:
+        prot_no_mbr = prot_no_mbr[~prot_no_mbr['Sample'].isin(EXCLUDED_SAMPLES)].copy()
     return prot_no_mbr
 
 
@@ -97,7 +101,7 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
     bg_source = bg_prot_override if bg_prot_override is not None else prot_with_lb
     bg_label = bg_label_override if bg_label_override is not None else engine_name
     bg_classes = (
-        analyze_background_ttest(bg_source, bg_label, OUT_DIR, GLOBAL_SEED, HIGHLIGHT_GENES)
+        analyze_background_ttest(bg_source, bg_label, OUT_DIR, HIGHLIGHT_GENES)
         if RUN_BACKGROUND_TTEST else {}
     )
     pdf_volcano = PdfPages(OUT_DIR / f"Volcano_{engine_name}.pdf") if RUN_VOLCANO else None
@@ -109,8 +113,8 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
 
     for subset_name, (df_prot, g_case, g_ctrl) in subsets_dict.items():
         print(f"\n  ➤ Processing subset: {subset_name}")
-        wide_df, c_samps, k_samps, s_to_g = prep_wide_df(df_prot, g_case, g_ctrl)
-        imputed_df = impute_perseus(wide_df, GLOBAL_SEED)
+        wide_quant, wide_pres, c_samps, k_samps, s_to_g = prep_wide_df(df_prot, g_case, g_ctrl)
+        imputed_df = impute_perseus(wide_quant, GLOBAL_SEED)
 
         if RUN_VOLCANO:
             det, sig_df, tops, hl_hits = analyze_volcano(
@@ -146,7 +150,7 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
 
         if RUN_FISHER:
             det, sig_df, tops, hl_hits = analyze_fisher(
-                wide_df, c_samps, k_samps, subset_name, P_CUTOFF, HIGHLIGHT_GENES
+                wide_pres, c_samps, k_samps, subset_name, P_CUTOFF, HIGHLIGHT_GENES
             )
             genes = sig_df['Gene'].tolist() if not sig_df.empty else []
             for g, d in zip(genes, det):
@@ -161,7 +165,6 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
                 f_out['Subset'] = subset_name
                 f_out['Analysis'] = 'Fisher'
                 f_out['Log2FC'] = pd.Series(dtype='float64', index=f_out.index)
-                f_out['FDR'] = pd.Series(dtype='float64', index=f_out.index)
                 engine_enriched_records.append(f_out)
 
         if RUN_PCA:
@@ -217,23 +220,23 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
 # MASTER SUMMARY
 # ==========================================
 def compile_master_summary(mq_res, fp_res, mq_all, fp_all):
-    print("\n" + "="*70 + "\n🏆 COMPILING MASTER CROSS-ENGINE SUMMARY (Proteins passing >=2/4 subsets in BOTH Engines)\n" + "="*70)
+    print(
+        "\n" + "=" * 70
+        + "\n🏆 COMPILING MASTER CROSS-ENGINE SUMMARY (FDR-significant in >=2 independent runs in BOTH Engines)\n"
+        + "=" * 70
+    )
+
+    def get_fdr_runs(res, gene):
+        hits = res['volcano_hits'].get(gene, []) + res['fisher_hits'].get(gene, [])
+        return sorted({h.split('_')[0] for h in hits if '_' in h})
 
     def get_passed_genes(res):
-        passed = set()
-        all_g = set(res['volcano_hits'].keys()) | set(res['fisher_hits'].keys()) | set(res['rf_hits'].keys())
-        for g in all_g:
-            if (
-                len(res['volcano_hits'].get(g, [])) >= 2
-                or len(res['fisher_hits'].get(g, [])) >= 2
-                or len(res['rf_hits'].get(g, [])) >= 2
-            ):
-                passed.add(g)
-        return passed
+        all_g = set(res['volcano_hits'].keys()) | set(res['fisher_hits'].keys())
+        return {g for g in all_g if len(get_fdr_runs(res, g)) >= 2}
 
     mq_passed = get_passed_genes(mq_res)
     fp_passed = get_passed_genes(fp_res)
-    valid_genes = mq_passed.intersection(fp_passed)
+    valid_genes = sorted(mq_passed.intersection(fp_passed))
 
     r6_mq_pep = _exclude_lb_samples(mq_all['run6_with_LB'].get('pep'))
     r6_fp_pep = _exclude_lb_samples(fp_all['run6_with_LB'].get('pep'))
@@ -246,6 +249,9 @@ def compile_master_summary(mq_res, fp_res, mq_all, fp_all):
         f_fp = len(fp_res['fisher_hits'].get(g, []))
         r_mq = len(mq_res['rf_hits'].get(g, []))
         r_fp = len(fp_res['rf_hits'].get(g, []))
+
+        mq_runs = ",".join(get_fdr_runs(mq_res, g))
+        fp_runs = ",".join(get_fdr_runs(fp_res, g))
 
         fmt = lambda x: str(x) if x > 0 else "-"
 
@@ -262,23 +268,24 @@ def compile_master_summary(mq_res, fp_res, mq_all, fp_all):
 
         summary_rows.append({
             'Gene': g,
+            'Independent_Runs(MQ|FP)': f"{mq_runs}|{fp_runs}",
             'GALD Peptide Interval': pep_string,
-            'Volcano(MQ|FP)': f"{fmt(v_mq)}|{fmt(v_fp)}",
-            'Fisher(MQ|FP)': f"{fmt(f_mq)}|{fmt(f_fp)}",
-            'RF_Top20(MQ|FP)': f"{fmt(r_mq)}|{fmt(r_fp)}",
+            'Volcano_FDR(MQ|FP)': f"{fmt(v_mq)}|{fmt(v_fp)}",
+            'Fisher_RawP(MQ|FP)': f"{fmt(f_mq)}|{fmt(f_fp)}",
+            'RF_Top20_Support(MQ|FP)': f"{fmt(r_mq)}|{fmt(r_fp)}",
             'Background_TTest(MQ)': mq_res['bg_class'].get(g, "Not Evaluated"),
-            'Background_TTest(FP)': fp_res['bg_class'].get(g, "Not Evaluated")
+            'Background_TTest(FP)': fp_res['bg_class'].get(g, "Not Evaluated"),
         })
 
     master_df = pd.DataFrame(summary_rows)
     out_file = OUT_DIR / "MASTER_CrossEngine_Relevant_Proteins.tsv"
 
     if not master_df.empty:
-        master_df = master_df.sort_values(by='Background_TTest(MQ)')
+        master_df = master_df.sort_values(by=['Background_TTest(MQ)', 'Gene'])
         master_df.to_csv(out_file, sep='\t', index=False)
         print(master_df.to_string(index=False))
     else:
-        print("No proteins passed the strict >=2 subsets criteria across BOTH engines.")
+        print("No proteins passed FDR significance across >=2 independent runs in BOTH engines.")
 
 
 if __name__ == "__main__":

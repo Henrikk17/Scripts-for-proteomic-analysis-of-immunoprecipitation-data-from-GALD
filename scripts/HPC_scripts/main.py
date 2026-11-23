@@ -18,6 +18,7 @@ from helper_functions.master_analytical_modules import (
     analyze_volcano, analyze_permutation_volcano, analyze_fisher,
     analyze_pca, analyze_rf, analyze_background_ttest
 )
+from helper_functions.load_fragPipe_proteomic_data import load_fragPipe_proteomic_data
 
 pd.set_option('display.max_rows', None)
 pd.set_option('display.max_columns', None)
@@ -45,6 +46,9 @@ CACHE_DIR = Path("../cache_master_pipeline")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Dedicated no-MBR FragPipe run 6 dataset (used ONLY for LB vs Liver background check)
+FP_NO_MBR_R6_DIR = Path("/home/local/s215065/results/LFQ_no_MBR_IM-MS/run6_with_LB")
+RUN6_ANNOT_FILE = Path("/home/local/s215065/data_analysis/experiment_annotation/experiment_annotation_run6_R1344.tsv")
 
 def _exclude_lb_samples(pep_df):
     """Return a copy of peptide detections excluding Lysate Buffer (LB) negative controls."""
@@ -71,13 +75,31 @@ def _exclude_lb_samples(pep_df):
     return df_filt[~lb_mask].copy()
 
 
+def _load_fp_no_mbr_r6_prot():
+    """Load run 6 no-MBR FragPipe protein detections strictly for background testing."""
+    if not FP_NO_MBR_R6_DIR.exists():
+        print(f"⚠️ Warning: No-MBR run 6 directory not found: {FP_NO_MBR_R6_DIR}")
+        return None
+    if not RUN6_ANNOT_FILE.exists():
+        print(f"⚠️ Warning: Run 6 annotation file not found: {RUN6_ANNOT_FILE}")
+        return None
+
+    prot_no_mbr, _ = load_fragPipe_proteomic_data(FP_NO_MBR_R6_DIR, RUN6_ANNOT_FILE)
+    return prot_no_mbr
+
+
 # ==========================================
 # PIPELINE EXECUTION
 # ==========================================
-def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
+def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_override=None, bg_label_override=None):
     print(f"\n{'='*70}\n🚀 RUNNING PIPELINE: {engine_name}\n{'='*70}")
 
-    bg_classes = analyze_background_ttest(prot_with_lb, engine_name, OUT_DIR, GLOBAL_SEED, HIGHLIGHT_GENES) if RUN_BACKGROUND_TTEST else {}
+    bg_source = bg_prot_override if bg_prot_override is not None else prot_with_lb
+    bg_label = bg_label_override if bg_label_override is not None else engine_name
+    bg_classes = (
+        analyze_background_ttest(bg_source, bg_label, OUT_DIR, GLOBAL_SEED, HIGHLIGHT_GENES)
+        if RUN_BACKGROUND_TTEST else {}
+    )
     pdf_volcano = PdfPages(OUT_DIR / f"Volcano_{engine_name}.pdf") if RUN_VOLCANO else None
     pdf_perm_volcano = PdfPages(OUT_DIR / f"Volcano_Perm_{engine_name}.pdf") if RUN_PERM_VOLCANO else None
     pdf_pca = PdfPages(OUT_DIR / f"PCA_{engine_name}.pdf") if RUN_PCA else None
@@ -190,6 +212,7 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name):
         'perm_volcano_up': res_perm_volcano,
     }
 
+
 # ==========================================
 # MASTER SUMMARY
 # ==========================================
@@ -257,18 +280,28 @@ def compile_master_summary(mq_res, fp_res, mq_all, fp_all):
     else:
         print("No proteins passed the strict >=2 subsets criteria across BOTH engines.")
 
+
 if __name__ == "__main__":
     print("Loading ONLY IM-MS FragPipe and MaxQuant data...")
 
     fp_all = get_fragpipe_imms_datasets(CACHE_DIR)
     mq_all = get_maxquant_datasets(CACHE_DIR)
 
+    # Dedicated no-MBR run 6 data used strictly for the LB vs Liver background check
+    fp_no_mbr_r6_prot = _load_fp_no_mbr_r6_prot()
+
     fp_sub = build_four_subsets(fp_all["run4"]["prot"], fp_all["run5"]["prot"], fp_all["run6_no_LB"]["prot"])
     mq_sub = build_four_subsets(mq_all["run4_no_LB"]["prot"], mq_all["run5_no_LB"]["prot"], mq_all["run6_no_LB"]["prot"])
 
     # Run sequentially to avoid Matplotlib & Scikit-Learn deadlocks
     mq_results = run_engine_pipeline(mq_sub, mq_all["run6_with_LB"]["prot"], "MaxQuant")
-    fp_results = run_engine_pipeline(fp_sub, fp_all["run6_with_LB"]["prot"], "FragPipe_IMMS")
+    fp_results = run_engine_pipeline(
+        fp_sub,
+        fp_all["run6_with_LB"]["prot"],
+        "FragPipe_IMMS",
+        bg_prot_override=fp_no_mbr_r6_prot,
+        bg_label_override="FragPipe_IMMS_noMBR_R6"
+    )
 
     if RUN_SUMMARY:
         compile_master_summary(mq_results, fp_results, mq_all, fp_all)

@@ -367,8 +367,15 @@ def analyze_background_ttest(prot_with_lb, engine_name, out_dir, seed, highlight
     nongald_pairs = []
 
     def classify_cohort(l_col, b_col):
-        grp = str(sample_to_group.get(l_col, sample_to_group.get(b_col, ''))).upper()
-        if 'GALD' in grp and 'NON' not in grp and 'CTRL' not in grp:
+        grp = str(sample_to_group.get(l_col, sample_to_group.get(b_col, ''))).strip().upper()
+        is_gald = (
+            'GALD' in grp
+            and 'SPOUSE' not in grp
+            and 'NON' not in grp
+            and 'CTRL' not in grp
+            and 'HEALTHY' not in grp
+        )
+        if is_gald:
             gald_pairs.append((l_col, b_col))
         else:
             nongald_pairs.append((l_col, b_col))

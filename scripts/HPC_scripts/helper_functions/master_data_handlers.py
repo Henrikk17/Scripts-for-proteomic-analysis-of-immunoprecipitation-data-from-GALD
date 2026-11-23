@@ -115,6 +115,15 @@ def _select_representative_protein_groups(df_clean, quant_col, sample_col='Sampl
         else ('Protein' if 'Protein' in df_clean.columns else 'Gene')
     )
 
+    if pg_col == 'Gene':
+        wide_df = df_clean.pivot_table(
+            index='Gene',
+            columns=sample_col,
+            values=quant_col,
+            aggfunc='max',
+        )
+        return wide_df.where(wide_df > 0)
+
     pg_wide = df_clean.pivot_table(
         index=[pg_col, 'Gene'],
         columns=sample_col,
@@ -127,14 +136,14 @@ def _select_representative_protein_groups(df_clean, quant_col, sample_col='Sampl
     mean_int = pg_wide.mean(axis=1, skipna=True).fillna(0.0)
 
     rank_df = pd.DataFrame({
-        'Gene': pg_wide.index.get_level_values('Gene'),
+        'gene_key': pg_wide.index.get_level_values('Gene'),
         'valid_n': valid_counts.values,
         'mean_int': mean_int.values,
     }, index=pg_wide.index)
 
     best_idx = (
-        rank_df.sort_values(by=['Gene', 'valid_n', 'mean_int'], ascending=[True, False, False])
-        .drop_duplicates(subset='Gene', keep='first')
+        rank_df.sort_values(by=['gene_key', 'valid_n', 'mean_int'], ascending=[True, False, False])
+        .drop_duplicates(subset='gene_key', keep='first')
         .index
     )
 

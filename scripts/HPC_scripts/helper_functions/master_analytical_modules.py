@@ -12,7 +12,10 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score
 from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
-from helper_functions.master_data_handlers import _select_representative_protein_groups
+from helper_functions.master_data_handlers import (
+    _select_representative_protein_groups,
+    get_gald_peptide_interval,
+)
 
 try:
     from adjustText import adjust_text
@@ -889,3 +892,225 @@ def analyze_background_ttest(
                 )
 
     return classifications
+
+
+# ==========================================
+# 7. SORTING, EXPORT, AND CROSS-ENGINE SUMMARY HELPERS
+# ==========================================
+def _exclude_lb_samples(pep_df):
+    """Return a copy of peptide detections excluding Lysate Buffer (LB) negative controls."""
+    if pep_df is None or pep_df.empty or 'Sample' not in pep_df.columns:
+        return pep_df
+
+    df_filt = pep_df.copy()
+    sample_str = df_filt['Sample'].astype(str).str.strip().str.lower()
+    name_lb = sample_str.str.contains(r'(?:^|_)lb$|buffer', regex=True, na=False)
+
+    s_num = pd.to_numeric(
+        sample_str.str.replace('sample_', '', regex=False).str.replace('sample', '', regex=False).str.strip(),
+        errors='coerce',
+    )
+    num_lb = s_num.between(43, 84, inclusive='both').fillna(False)
+
+    if 'Sample_type' in df_filt.columns:
+        stype = df_filt['Sample_type'].astype(str).str.strip().str.lower()
+        type_lb = stype.str.contains(r'\blb\b|buffer', regex=True, na=False)
+        lb_mask = type_lb | name_lb
+    else:
+        lb_mask = name_lb | num_lb
+
+    return df_filt[~lb_mask].copy()
+
+
+def export_engine_tables(engine_enriched_records, engine_watchlist_records, engine_name, out_dir):
+    """Clean, sort, and export per-engine enriched protein tables and the borderline exclusive watchlist."""
+    out_path = Path(out_dir)
+
+    non_empty_records = [df_rec for df_rec in engine_enriched_records if not df_rec.empty]
+    if non_empty_records:
+        df_out = pd.concat(non_empty_records, ignore_index=True)
+        col_order = [
+            'Subset', 'Analysis', 'Gene', 'Log2FC', 'p_value', 'FDR',
+            'GALD_sample_presence', 'Non-GALD_sample_presence',
+            'GALD_Mean_Log2Int', 'Subset_GALD_Avg_Log2Int', 'Above_Avg_GALD_Int',
+            'Exclusivity', 'Volcano_Filtered_Out',
+        ]
+        ordered_cols = [c for c in col_order if c in df_out.columns]
+
+        for num_col in ['Log2FC', 'p_value', 'FDR', 'GALD_Mean_Log2Int', 'Subset_GALD_Avg_Log2Int']:
+            if num_col in df_out.columns:
+                df_out[num_col] = pd.to_numeric(df_out[num_col], errors='coerce')
+
+        for pres_col in ['GALD_sample_presence', 'Non-GALD_sample_presence']:
+            if pres_col in df_out.columns:
+                df_out[pres_col] = pd.to_numeric(df_out[pres_col], errors='coerce').astype('Int64')
+
+        sort_cols = [c for c in ['Subset', 'Analysis', 'p_value', 'GALD_Mean_Log2Int'] if c in df_out.columns]
+        sort_asc = [False if c == 'GALD_Mean_Log2Int' else True for c in sort_cols]
+        df_out = df_out[ordered_cols].sort_values(by=sort_cols, ascending=sort_asc, na_position='last')
+        df_out.to_csv(out_path / f"{engine_name}_Enriched_Proteins.txt", sep='\t', index=False)
+
+    non_empty_wl = [df_wl for df_wl in engine_watchlist_records if not df_wl.empty]
+    if non_empty_wl:
+        wl_all = pd.concat(non_empty_wl, ignore_index=True)
+        wl_cols = [
+            'Subset', 'Gene', 'p_value', 'GALD_sample_presence', 'Non-GALD_sample_presence',
+            'GALD_Mean_Log2Int', 'Subset_GALD_Avg_Log2Int', 'Above_Avg_GALD_Int',
+            'Exclusivity', 'Volcano_Filtered_Out',
+        ]
+        wl_all = wl_all[[c for c in wl_cols if c in wl_all.columns]].sort_values(
+            by=['Subset', 'p_value', 'GALD_Mean_Log2Int'],
+            ascending=[True, True, False],
+            na_position='last',
+        )
+        wl_all.to_csv(out_path / f"{engine_name}_VolcanoFiltered_Exclusive_Watchlist.tsv", sep='\t', index=False)
+
+
+def compile_master_summary(mq_res, fp_res, mq_all, fp_all, out_dir):
+    print(
+        "\n" + "=" * 70
+        + "\n🏆 COMPILING MASTER CROSS-ENGINE SUMMARY (Significant in >=2 independent runs in BOTH Engines: Volcano BH-FDR or Fisher Raw-p)\n"
+        + "=" * 70
+    )
+
+    def get_sig_runs(res, gene):
+        hits = res['volcano_hits'].get(gene, []) + res['fisher_hits'].get(gene, [])
+        return sorted({h.split('_')[0] for h in hits if '_' in h})
+
+    def get_passed_genes(res):
+        all_g = set(res['volcano_hits'].keys()) | set(res['fisher_hits'].keys())
+        return {g for g in all_g if len(get_sig_runs(res, g)) >= 2}
+
+    mq_passed = get_passed_genes(mq_res)
+    fp_passed = get_passed_genes(fp_res)
+    valid_genes = sorted(mq_passed.intersection(fp_passed))
+
+    r6_mq_pep = _exclude_lb_samples(mq_all['run6_with_LB'].get('pep'))
+    r6_fp_pep = _exclude_lb_samples(fp_all['run6_with_LB'].get('pep'))
+
+    summary_rows = []
+    for g in valid_genes:
+        v_mq = len(mq_res['volcano_hits'].get(g, []))
+        v_fp = len(fp_res['volcano_hits'].get(g, []))
+        f_mq = len(mq_res['fisher_hits'].get(g, []))
+        f_fp = len(fp_res['fisher_hits'].get(g, []))
+        fa_mq = len(mq_res.get('fisher_above_avg', {}).get(g, []))
+        fa_fp = len(fp_res.get('fisher_above_avg', {}).get(g, []))
+        r_mq = len(mq_res['rf_hits'].get(g, []))
+        r_fp = len(fp_res['rf_hits'].get(g, []))
+
+        mq_runs = ",".join(get_sig_runs(mq_res, g))
+        fp_runs = ",".join(get_sig_runs(fp_res, g))
+
+        excl_mq = ",".join(sorted({s.split('_')[0] for s in mq_res.get('highint_exclusive', {}).get(g, [])})) or "-"
+        excl_fp = ",".join(sorted({s.split('_')[0] for s in fp_res.get('highint_exclusive', {}).get(g, [])})) or "-"
+
+        fmt = lambda x: str(x) if x > 0 else "-"
+
+        r4_mq = get_gald_peptide_interval(mq_all['run4_no_LB'].get('pep'), g)
+        r4_fp = get_gald_peptide_interval(fp_all['run4'].get('pep'), g)
+        r5_mq = get_gald_peptide_interval(mq_all['run5_no_LB'].get('pep'), g)
+        r5_fp = get_gald_peptide_interval(fp_all['run5'].get('pep'), g)
+        r6_mq = get_gald_peptide_interval(r6_mq_pep, g)
+        r6_fp = get_gald_peptide_interval(r6_fp_pep, g)
+
+        pep_string = f"[MQ/FP run 4: {r4_mq}/{r4_fp}, MQ/FP run 5: {r5_mq}/{r5_fp}, MQ/FP run 6: {r6_mq}/{r6_fp}]"
+
+        summary_rows.append({
+            'Gene': g,
+            'Independent_Runs(MQ|FP)': f"{mq_runs}|{fp_runs}",
+            'GALD Peptide Interval': pep_string,
+            'Volcano_FDR(MQ|FP)': f"{fmt(v_mq)}|{fmt(v_fp)}",
+            'Fisher_RawP(MQ|FP)': f"{fmt(f_mq)}|{fmt(f_fp)}",
+            'Fisher_AboveAvgInt(MQ|FP)': f"{fmt(fa_mq)}|{fmt(fa_fp)}",
+            'HighInt_GALD_Exclusive(MQ|FP)': f"{excl_mq}|{excl_fp}",
+            'RF_Top20_Support(MQ|FP)': f"{fmt(r_mq)}|{fmt(r_fp)}",
+            'Background_TTest(MQ)': mq_res['bg_class'].get(g, "Not Evaluated"),
+            'Background_TTest(FP)': fp_res['bg_class'].get(g, "Not Evaluated"),
+        })
+
+    master_df = pd.DataFrame(summary_rows)
+    out_file = Path(out_dir) / "MASTER_CrossEngine_Relevant_Proteins.tsv"
+
+    if not master_df.empty:
+        master_df = master_df.sort_values(by=['Background_TTest(MQ)', 'Gene'])
+        master_df.to_csv(out_file, sep='\t', index=False)
+        print(master_df.to_string(index=False))
+    else:
+        print("No proteins passed significance across >=2 independent runs in BOTH engines.")
+
+
+def compile_above_avg_fisher_overlap(mq_res, fp_res, mq_all, fp_all, out_dir, highlight_genes):
+    print(
+        "\n" + "=" * 70
+        + "\n🎯 CROSS-ENGINE OVERLAP: ABOVE-AVERAGE GALD INTENSITY FISHER HITS (MaxQuant ∩ FragPipe)\n"
+        + "=" * 70
+    )
+
+    mq_above = mq_res.get('fisher_above_avg', {})
+    fp_above = fp_res.get('fisher_above_avg', {})
+    overlap_genes = sorted(set(mq_above.keys()).intersection(set(fp_above.keys())))
+
+    out_file = Path(out_dir) / "MASTER_CrossEngine_AboveAvg_Fisher_Overlap.tsv"
+
+    if not overlap_genes:
+        print("No overlapping above-average GALD intensity Fisher hits found across MaxQuant and FragPipe.")
+        return
+
+    mq_details_map = mq_res.get('fisher_above_avg_details', {})
+    fp_details_map = fp_res.get('fisher_above_avg_details', {})
+
+    r6_mq_pep = _exclude_lb_samples(mq_all['run6_with_LB'].get('pep'))
+    r6_fp_pep = _exclude_lb_samples(fp_all['run6_with_LB'].get('pep'))
+
+    rows = []
+    for g in overlap_genes:
+        mq_d = mq_details_map.get(g, [])
+        fp_d = fp_details_map.get(g, [])
+
+        mq_runs = ",".join(sorted({d['subset'].split('_')[0] for d in mq_d})) or "-"
+        fp_runs = ",".join(sorted({d['subset'].split('_')[0] for d in fp_d})) or "-"
+
+        mq_pres = "; ".join(f"{d['subset']}: {d['pres']} (p={d['p_value']:.3g})" for d in mq_d)
+        fp_pres = "; ".join(f"{d['subset']}: {d['pres']} (p={d['p_value']:.3g})" for d in fp_d)
+
+        mq_mean_int = float(np.nanmean([d['log2_int'] for d in mq_d])) if mq_d else np.nan
+        fp_mean_int = float(np.nanmean([d['log2_int'] for d in fp_d])) if fp_d else np.nan
+
+        mq_excl = ", ".join(sorted({d['exclusivity'] for d in mq_d})) or "-"
+        fp_excl = ", ".join(sorted({d['exclusivity'] for d in fp_d})) or "-"
+
+        mq_vf = "Yes" if any(d['volcano_filtered'] for d in mq_d) else "No"
+        fp_vf = "Yes" if any(d['volcano_filtered'] for d in fp_d) else "No"
+
+        r4_mq = get_gald_peptide_interval(mq_all['run4_no_LB'].get('pep'), g)
+        r4_fp = get_gald_peptide_interval(fp_all['run4'].get('pep'), g)
+        r5_mq = get_gald_peptide_interval(mq_all['run5_no_LB'].get('pep'), g)
+        r5_fp = get_gald_peptide_interval(fp_all['run5'].get('pep'), g)
+        r6_mq = get_gald_peptide_interval(r6_mq_pep, g)
+        r6_fp = get_gald_peptide_interval(r6_fp_pep, g)
+
+        pep_string = f"[MQ/FP run 4: {r4_mq}/{r4_fp}, MQ/FP run 5: {r5_mq}/{r5_fp}, MQ/FP run 6: {r6_mq}/{r6_fp}]"
+
+        rows.append({
+            'Gene': g,
+            'Candidate': "*" if g in highlight_genes else "",
+            'Independent_Runs(MQ|FP)': f"{mq_runs}|{fp_runs}",
+            'Mean_GALD_Log2Int(MQ|FP)': f"{mq_mean_int:.2f}|{fp_mean_int:.2f}",
+            'Volcano_Filtered(MQ|FP)': f"{mq_vf}|{fp_vf}",
+            'Exclusivity(MQ)': mq_excl,
+            'Exclusivity(FP)': fp_excl,
+            'MQ_Presence_and_RawP': mq_pres,
+            'FP_Presence_and_RawP': fp_pres,
+            'GALD Peptide Interval': pep_string,
+            'Background_TTest(MQ)': mq_res['bg_class'].get(g, "Not Evaluated"),
+            'Background_TTest(FP)': fp_res['bg_class'].get(g, "Not Evaluated"),
+        })
+
+    overlap_df = pd.DataFrame(rows).sort_values(
+        by=['Background_TTest(MQ)', 'Exclusivity(MQ)', 'Gene']
+    )
+    overlap_df.to_csv(out_file, sep='\t', index=False)
+    print(f"Found {len(overlap_df)} overlapping above-average GALD intensity Fisher hits:")
+    print(overlap_df.to_string(index=False))
+    print(f"Saved overlap table to: {out_file.resolve()}")

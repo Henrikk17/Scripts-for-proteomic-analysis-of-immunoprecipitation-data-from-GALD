@@ -11,11 +11,12 @@ from matplotlib.backends.backend_pdf import PdfPages
 # Import from our compartmentalized modules
 from helper_functions.master_data_handlers import (
     get_maxquant_datasets, get_fragpipe_imms_datasets, build_four_subsets,
-    prep_wide_df, impute_perseus, get_gald_peptide_interval
+    prep_wide_df, impute_perseus
 )
 from helper_functions.master_analytical_modules import (
-    analyze_volcano, analyze_fisher,
-    analyze_pca, analyze_rf, analyze_background_ttest
+    analyze_volcano, analyze_fisher, analyze_pca, analyze_rf,
+    analyze_background_ttest, export_engine_tables,
+    compile_master_summary, compile_above_avg_fisher_overlap
 )
 from helper_functions.load_fragPipe_proteomic_data import load_fragPipe_proteomic_data
 
@@ -46,31 +47,6 @@ FP_NO_MBR_R6_DIR = Path("/home/local/s215065/results/LFQ_no_MBR_IM-MS/run6_with_
 RUN6_ANNOT_FILE = Path("/home/local/s215065/data_analysis/experiment_annotation/experiment_annotation_run6_R1344.tsv")
 
 EXCLUDED_SAMPLES = ['sample_14', 'sample_56']
-
-
-def _exclude_lb_samples(pep_df):
-    """Return a copy of peptide detections excluding Lysate Buffer (LB) negative controls."""
-    if pep_df is None or pep_df.empty or 'Sample' not in pep_df.columns:
-        return pep_df
-
-    df_filt = pep_df.copy()
-    sample_str = df_filt['Sample'].astype(str).str.strip().str.lower()
-    name_lb = sample_str.str.contains(r'(?:^|_)lb$|buffer', regex=True, na=False)
-
-    s_num = pd.to_numeric(
-        sample_str.str.replace('sample_', '', regex=False).str.replace('sample', '', regex=False).str.strip(),
-        errors='coerce'
-    )
-    num_lb = s_num.between(43, 84, inclusive='both').fillna(False)
-
-    if 'Sample_type' in df_filt.columns:
-        stype = df_filt['Sample_type'].astype(str).str.strip().str.lower()
-        type_lb = stype.str.contains(r'\blb\b|buffer', regex=True, na=False)
-        lb_mask = type_lb | name_lb
-    else:
-        lb_mask = name_lb | num_lb
-
-    return df_filt[~lb_mask].copy()
 
 
 def _load_fp_no_mbr_r6_prot():
@@ -104,7 +80,7 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
     pdf_pca = PdfPages(OUT_DIR / f"PCA_{engine_name}.pdf") if RUN_PCA else None
 
     res_volcano, res_fisher, res_rf = {}, {}, {}
-    res_fisher_above_avg, res_highint_exclusive = {}, {}
+    res_fisher_above_avg, res_fisher_above_avg_details, res_highint_exclusive = {}, {}, {}
     engine_enriched_records = []
     engine_watchlist_records = []
 
@@ -136,18 +112,22 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
                     tags = []
                     for _, r in above_avg_df.iterrows():
                         g = r['Gene']
+                        pres_str = f"{int(r['GALD_sample_presence'])}/{len(c_samps)} vs {int(r['Non-GALD_sample_presence'])}/{len(k_samps)}"
                         res_fisher_above_avg.setdefault(g, []).append(subset_name)
+                        res_fisher_above_avg_details.setdefault(g, []).append({
+                            'subset': subset_name,
+                            'pres': pres_str,
+                            'p_value': float(r['p_value']),
+                            'log2_int': float(r['GALD_Mean_Log2Int']),
+                            'exclusivity': str(r['Exclusivity']),
+                            'volcano_filtered': bool(r['Volcano_Filtered_Out']),
+                        })
                         if r['Non-GALD_sample_presence'] <= 1:
                             res_highint_exclusive.setdefault(g, set()).add(subset_name)
                         if r['Volcano_Filtered_Out']:
-                            volcano_filtered_fisher_callout.append(
-                                f"{g} ({int(r['GALD_sample_presence'])}/{len(c_samps)} vs {int(r['Non-GALD_sample_presence'])}/{len(k_samps)})"
-                            )
+                            volcano_filtered_fisher_callout.append(f"{g} ({pres_str})")
                         vf_flag = ", Volcano-Filtered" if r['Volcano_Filtered_Out'] else ""
-                        tags.append(
-                            f"{g} ({int(r['GALD_sample_presence'])}/{len(c_samps)} vs {int(r['Non-GALD_sample_presence'])}/{len(k_samps)}, "
-                            f"log2={r['GALD_Mean_Log2Int']:.1f}{vf_flag})"
-                        )
+                        tags.append(f"{g} ({pres_str}, log2={r['GALD_Mean_Log2Int']:.1f}{vf_flag})")
                     print(
                         f"      * Fisher Above-Avg GALD Intensity (>{subset_avg_val:.1f} log2, n={len(above_avg_df)}): "
                         + ", ".join(tags[:10])
@@ -220,132 +200,18 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
     if RUN_PCA:
         pdf_pca.close()
 
-    # Compile and export all enriched subsets for this engine
-    non_empty_records = [df_rec for df_rec in engine_enriched_records if not df_rec.empty]
-    if non_empty_records:
-        df_out = pd.concat(non_empty_records, ignore_index=True)
-        col_order = [
-            'Subset', 'Analysis', 'Gene', 'Log2FC', 'p_value', 'FDR',
-            'GALD_sample_presence', 'Non-GALD_sample_presence',
-            'GALD_Mean_Log2Int', 'Subset_GALD_Avg_Log2Int', 'Above_Avg_GALD_Int',
-            'Exclusivity', 'Volcano_Filtered_Out',
-        ]
-        ordered_cols = [c for c in col_order if c in df_out.columns]
-
-        for num_col in ['Log2FC', 'p_value', 'FDR', 'GALD_Mean_Log2Int', 'Subset_GALD_Avg_Log2Int']:
-            if num_col in df_out.columns:
-                df_out[num_col] = pd.to_numeric(df_out[num_col], errors='coerce')
-
-        for pres_col in ['GALD_sample_presence', 'Non-GALD_sample_presence']:
-            if pres_col in df_out.columns:
-                df_out[pres_col] = pd.to_numeric(df_out[pres_col], errors='coerce').astype('Int64')
-
-        sort_cols = [c for c in ['Subset', 'Analysis', 'p_value', 'GALD_Mean_Log2Int'] if c in df_out.columns]
-        sort_asc = [False if c == 'GALD_Mean_Log2Int' else True for c in sort_cols]
-        df_out = df_out[ordered_cols].sort_values(by=sort_cols, ascending=sort_asc, na_position='last')
-        df_out.to_csv(OUT_DIR / f"{engine_name}_Enriched_Proteins.txt", sep='\t', index=False)
-
-    # Export Volcano-filtered borderline exclusive watchlist (safeguard)
-    non_empty_wl = [df_wl for df_wl in engine_watchlist_records if not df_wl.empty]
-    if non_empty_wl:
-        wl_all = pd.concat(non_empty_wl, ignore_index=True)
-        wl_cols = [
-            'Subset', 'Gene', 'p_value', 'GALD_sample_presence', 'Non-GALD_sample_presence',
-            'GALD_Mean_Log2Int', 'Subset_GALD_Avg_Log2Int', 'Above_Avg_GALD_Int',
-            'Exclusivity', 'Volcano_Filtered_Out',
-        ]
-        wl_all = wl_all[[c for c in wl_cols if c in wl_all.columns]].sort_values(
-            by=['Subset', 'p_value', 'GALD_Mean_Log2Int'], ascending=[True, True, False], na_position='last'
-        )
-        wl_all.to_csv(OUT_DIR / f"{engine_name}_VolcanoFiltered_Exclusive_Watchlist.tsv", sep='\t', index=False)
+    # Sort and export per-engine enriched tables and borderline watchlist
+    export_engine_tables(engine_enriched_records, engine_watchlist_records, engine_name, OUT_DIR)
 
     return {
         'bg_class': bg_classes,
         'volcano_hits': res_volcano,
         'fisher_hits': res_fisher,
         'fisher_above_avg': res_fisher_above_avg,
+        'fisher_above_avg_details': res_fisher_above_avg_details,
         'highint_exclusive': {g: sorted(subs) for g, subs in res_highint_exclusive.items()},
         'rf_hits': res_rf,
     }
-
-
-# ==========================================
-# MASTER SUMMARY
-# ==========================================
-def compile_master_summary(mq_res, fp_res, mq_all, fp_all):
-    print(
-        "\n" + "=" * 70
-        + "\n🏆 COMPILING MASTER CROSS-ENGINE SUMMARY (Significant in >=2 independent runs in BOTH Engines: Volcano BH-FDR or Fisher Raw-p)\n"
-        + "=" * 70
-    )
-
-    def get_sig_runs(res, gene):
-        hits = res['volcano_hits'].get(gene, []) + res['fisher_hits'].get(gene, [])
-        return sorted({h.split('_')[0] for h in hits if '_' in h})
-
-    def get_passed_genes(res):
-        all_g = set(res['volcano_hits'].keys()) | set(res['fisher_hits'].keys())
-        return {g for g in all_g if len(get_sig_runs(res, g)) >= 2}
-
-    mq_passed = get_passed_genes(mq_res)
-    fp_passed = get_passed_genes(fp_res)
-    valid_genes = sorted(mq_passed.intersection(fp_passed))
-
-    r6_mq_pep = _exclude_lb_samples(mq_all['run6_with_LB'].get('pep'))
-    r6_fp_pep = _exclude_lb_samples(fp_all['run6_with_LB'].get('pep'))
-
-    summary_rows = []
-    for g in valid_genes:
-        v_mq = len(mq_res['volcano_hits'].get(g, []))
-        v_fp = len(fp_res['volcano_hits'].get(g, []))
-        f_mq = len(mq_res['fisher_hits'].get(g, []))
-        f_fp = len(fp_res['fisher_hits'].get(g, []))
-        fa_mq = len(mq_res.get('fisher_above_avg', {}).get(g, []))
-        fa_fp = len(fp_res.get('fisher_above_avg', {}).get(g, []))
-        r_mq = len(mq_res['rf_hits'].get(g, []))
-        r_fp = len(fp_res['rf_hits'].get(g, []))
-
-        mq_runs = ",".join(get_sig_runs(mq_res, g))
-        fp_runs = ",".join(get_sig_runs(fp_res, g))
-
-        excl_mq = ",".join(sorted({s.split('_')[0] for s in mq_res.get('highint_exclusive', {}).get(g, [])})) or "-"
-        excl_fp = ",".join(sorted({s.split('_')[0] for s in fp_res.get('highint_exclusive', {}).get(g, [])})) or "-"
-
-        fmt = lambda x: str(x) if x > 0 else "-"
-
-        r4_mq = get_gald_peptide_interval(mq_all['run4_no_LB'].get('pep'), g)
-        r4_fp = get_gald_peptide_interval(fp_all['run4'].get('pep'), g)
-
-        r5_mq = get_gald_peptide_interval(mq_all['run5_no_LB'].get('pep'), g)
-        r5_fp = get_gald_peptide_interval(fp_all['run5'].get('pep'), g)
-
-        r6_mq = get_gald_peptide_interval(r6_mq_pep, g)
-        r6_fp = get_gald_peptide_interval(r6_fp_pep, g)
-
-        pep_string = f"[MQ/FP run 4: {r4_mq}/{r4_fp}, MQ/FP run 5: {r5_mq}/{r5_fp}, MQ/FP run 6: {r6_mq}/{r6_fp}]"
-
-        summary_rows.append({
-            'Gene': g,
-            'Independent_Runs(MQ|FP)': f"{mq_runs}|{fp_runs}",
-            'GALD Peptide Interval': pep_string,
-            'Volcano_FDR(MQ|FP)': f"{fmt(v_mq)}|{fmt(v_fp)}",
-            'Fisher_RawP(MQ|FP)': f"{fmt(f_mq)}|{fmt(f_fp)}",
-            'Fisher_AboveAvgInt(MQ|FP)': f"{fmt(fa_mq)}|{fmt(fa_fp)}",
-            'HighInt_GALD_Exclusive(MQ|FP)': f"{excl_mq}|{excl_fp}",
-            'RF_Top20_Support(MQ|FP)': f"{fmt(r_mq)}|{fmt(r_fp)}",
-            'Background_TTest(MQ)': mq_res['bg_class'].get(g, "Not Evaluated"),
-            'Background_TTest(FP)': fp_res['bg_class'].get(g, "Not Evaluated"),
-        })
-
-    master_df = pd.DataFrame(summary_rows)
-    out_file = OUT_DIR / "MASTER_CrossEngine_Relevant_Proteins.tsv"
-
-    if not master_df.empty:
-        master_df = master_df.sort_values(by=['Background_TTest(MQ)', 'Gene'])
-        master_df.to_csv(out_file, sep='\t', index=False)
-        print(master_df.to_string(index=False))
-    else:
-        print("No proteins passed significance across >=2 independent runs in BOTH engines.")
 
 
 if __name__ == "__main__":
@@ -367,10 +233,13 @@ if __name__ == "__main__":
         fp_all["run6_with_LB"]["prot"],
         "FragPipe_IMMS",
         bg_prot_override=fp_no_mbr_r6_prot,
-        bg_label_override="FragPipe_IMMS_noMBR_R6"
+        bg_label_override="FragPipe_IMMS_noMBR_R6",
     )
 
     if RUN_SUMMARY:
-        compile_master_summary(mq_results, fp_results, mq_all, fp_all)
+        compile_master_summary(mq_results, fp_results, mq_all, fp_all, OUT_DIR)
+
+    if RUN_FISHER:
+        compile_above_avg_fisher_overlap(mq_results, fp_results, mq_all, fp_all, OUT_DIR, HIGHLIGHT_GENES)
 
     print(f"\n📁 All plots successfully generated and saved to: {OUT_DIR.resolve()}")

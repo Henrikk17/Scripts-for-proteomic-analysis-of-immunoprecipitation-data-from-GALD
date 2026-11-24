@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.stats import binomtest, fisher_exact, ttest_1samp, ttest_ind
+from scipy.stats import fisher_exact, ttest_1samp, ttest_ind
 from statsmodels.stats.multitest import multipletests
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
@@ -21,6 +21,52 @@ except ImportError:
 
 
 
+# ==========================================
+# SHARED HELPER: PRE-IMPUTATION GALD INTENSITY & EXCLUSIVITY
+# ==========================================
+def _compute_gald_intensity_stats(wide_pres, c_samps, k_samps):
+    """
+    Compute per-gene GALD presence, control presence, raw-positive mean log2
+    intensity in GALD, and whether each gene is above the subset's average
+    GALD protein log2 intensity (prior to any imputation).
+    """
+    if wide_pres is None or wide_pres.empty or not c_samps:
+        return pd.DataFrame(), np.nan
+
+    c_raw = wide_pres[c_samps].where(wide_pres[c_samps] > 0)
+    c_log2 = np.log2(c_raw)
+    gene_mean_log2 = c_log2.mean(axis=1, skipna=True)
+    valid_means = gene_mean_log2.dropna()
+    subset_avg_log2 = float(valid_means.mean()) if not valid_means.empty else np.nan
+
+    c_counts = c_raw.notna().sum(axis=1).astype(int)
+    k_counts = (
+        wide_pres[k_samps].where(wide_pres[k_samps] > 0).notna().sum(axis=1).astype(int)
+        if k_samps else pd.Series(0, index=wide_pres.index, dtype=int)
+    )
+
+    n_k = max(len(k_samps), 1)
+    exclusivity = np.where(
+        k_counts == 0,
+        "GALD-Exclusive (0 Ctrl)",
+        np.where(
+            (k_counts <= 1) | ((k_counts / n_k) <= 0.10),
+            "Almost GALD-Exclusive (<=1 Ctrl)",
+            "GALD-Enriched Presence",
+        ),
+    )
+
+    stats_df = pd.DataFrame({
+        'GALD_sample_presence': c_counts,
+        'Non-GALD_sample_presence': k_counts,
+        'GALD_Mean_Log2Int': gene_mean_log2,
+        'Subset_GALD_Avg_Log2Int': subset_avg_log2,
+        'Above_Avg_GALD_Int': gene_mean_log2 > subset_avg_log2 if np.isfinite(subset_avg_log2) else False,
+        'Exclusivity': exclusivity,
+    }, index=wide_pres.index)
+
+    return stats_df, subset_avg_log2
+
 
 # ==========================================
 # 1. VOLCANO PLOT (WELCH'S T-TEST + BH-FDR)
@@ -36,6 +82,8 @@ def analyze_volcano(
     p_cutoff,
     fc_cutoff,
     highlight_genes,
+    wide_pres=None,
+    volcano_filtered_fisher_hits=None,
 ):
     if imputed_df.empty or len(c_samps) < 2 or len(k_samps) < 2:
         return [], pd.DataFrame(), [], []
@@ -57,6 +105,13 @@ def analyze_volcano(
 
     sig = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'] >= fc_cutoff)].copy()
     down = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'] <= -fc_cutoff)].copy()
+
+    # Attach pre-imputation presence, GALD intensity, and exclusivity context
+    if wide_pres is not None and not wide_pres.empty and not sig.empty:
+        pres_stats, _ = _compute_gald_intensity_stats(wide_pres, c_samps, k_samps)
+        if not pres_stats.empty:
+            sig = sig.merge(pres_stats, left_on='Gene', right_index=True, how='left')
+            sig['Volcano_Filtered_Out'] = False
 
     top_hits = sig.sort_values(by=stat).head(10)['Gene'].tolist()
     hl_hits = [g for g in highlight_genes if g in sig['Gene'].values]
@@ -136,6 +191,22 @@ def analyze_volcano(
         ax.set_xlabel(r'$\log_2(\text{Fold Change})$ (GALD vs Control)')
         ax.set_ylabel(y_label_text)
 
+        # Surface high-intensity Fisher hits that were filtered out of Volcano (<50% completeness)
+        if volcano_filtered_fisher_hits:
+            max_show = 12
+            shown = volcano_filtered_fisher_hits[:max_show]
+            extra = len(volcano_filtered_fisher_hits) - len(shown)
+            note = (
+                "Volcano-filtered (<50% completeness) but significant in Fisher w/ Above-Avg GALD intensity: "
+                + ", ".join(shown)
+                + (f" (+{extra} more)" if extra > 0 else "")
+            )
+            fig.text(
+                0.5, -0.02, note,
+                ha='center', va='top', fontsize=7.5, color='#4a1c1c',
+                bbox=dict(boxstyle='round,pad=0.35', facecolor='#fff4e6', edgecolor='#d97706', lw=0.8),
+            )
+
         pdf_obj.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
@@ -144,140 +215,22 @@ def analyze_volcano(
 
 
 # ==========================================
-# 2. PERMUTATION VOLCANO (EXPERIMENTAL / OPTIONAL)
+# 3. FISHER'S EXACT TEST (PRESENCE/ABSENCE, RAW P-VALUE + GALD INTENSITY)
 # ==========================================
-def analyze_permutation_volcano(
-    imputed_df,
+def analyze_fisher(
+    wide_pres,
     c_samps,
     k_samps,
     subset_name,
-    engine_name,
-    pdf_obj,
     p_cutoff,
-    fc_cutoff,
     highlight_genes,
-    seed,
-    n_perm=250,
+    volcano_genes=None,
+    watchlist_p_cutoff=0.10,
 ):
-    if imputed_df.empty or len(c_samps) < 2 or len(k_samps) < 2:
-        return [], [], []
-
-    rng = np.random.default_rng(seed)
-    all_samps = list(c_samps) + list(k_samps)
-    data = imputed_df[all_samps].values
-    n_c = len(c_samps)
-    n_tot = len(all_samps)
-    genes = imputed_df.index.values
-
-    c_data = data[:, :n_c]
-    k_data = data[:, n_c:]
-    obs_fc = np.mean(c_data, axis=1) - np.mean(k_data, axis=1)
-    obs_t, obs_p = ttest_ind(c_data, k_data, axis=1, equal_var=False)
-
-    valid_mask = np.isfinite(obs_t) & np.isfinite(obs_p) & np.isfinite(obs_fc)
-    if not valid_mask.any():
-        return [], [], []
-
-    data = data[valid_mask]
-    genes = genes[valid_mask]
-    obs_fc = obs_fc[valid_mask]
-    obs_t = obs_t[valid_mask]
-    obs_p = obs_p[valid_mask]
-    abs_obs_t = np.abs(obs_t)
-
-    # Generate null |t| distribution via sample-label permutations
-    null_abs_t = np.empty((n_perm, len(genes)), dtype=float)
-    for b in range(n_perm):
-        perm_idx = rng.permutation(n_tot)
-        p_c = data[:, perm_idx[:n_c]]
-        p_k = data[:, perm_idx[n_c:]]
-        t_b, _ = ttest_ind(p_c, p_k, axis=1, equal_var=False)
-        null_abs_t[b] = np.abs(np.nan_to_num(t_b, nan=0.0))
-
-    sorted_null = np.sort(null_abs_t.ravel())
-    order = np.argsort(-abs_obs_t)  # Most significant to least significant
-    sorted_obs = abs_obs_t[order]
-
-    # Expected false positives at each threshold / observed discoveries
-    n_null_ge = len(sorted_null) - np.searchsorted(sorted_null, sorted_obs, side='left')
-    exp_fp = n_null_ge / float(n_perm)
-    ranks = np.arange(1, len(sorted_obs) + 1, dtype=float)
-    raw_fdr = np.minimum(1.0, exp_fp / ranks)
-
-    # Backward cumulative minimum enforces monotonicity from least to most significant
-    mono_fdr = np.minimum.accumulate(raw_fdr[::-1])[::-1]
-    perm_fdr = np.empty_like(mono_fdr)
-    perm_fdr[order] = mono_fdr
-
-    v_df = pd.DataFrame({
-        'Gene': genes,
-        'Log2FC': obs_fc,
-        'p_value': obs_p,
-        'Perm_FDR': perm_fdr,
-    })
-    v_df['neg_log10_fdr'] = -np.log10(np.clip(v_df['Perm_FDR'].values, 1e-300, 1.0))
-
-    sig = v_df[(v_df['Perm_FDR'] < p_cutoff) & (v_df['Log2FC'] >= fc_cutoff)].copy()
-    down = v_df[(v_df['Perm_FDR'] < p_cutoff) & (v_df['Log2FC'] <= -fc_cutoff)].copy()
-
-    top_hits = sig.sort_values(by=['Perm_FDR', 'p_value']).head(10)['Gene'].tolist()
-    hl_hits = [g for g in highlight_genes if g in sig['Gene'].values]
-
-    if pdf_obj:
-        fig, ax = plt.subplots(figsize=(10, 8))
-        ax.scatter(v_df['Log2FC'], v_df['neg_log10_fdr'], alpha=0.5, color='grey', s=10, zorder=1)
-        ax.scatter(sig['Log2FC'], sig['neg_log10_fdr'], alpha=0.8, color='firebrick', s=20, zorder=2)
-        ax.scatter(down['Log2FC'], down['neg_log10_fdr'], alpha=0.8, color='steelblue', s=20, zorder=2)
-
-        ax.set_title(f"{engine_name} Permutation Volcano: {subset_name} (n_perm={n_perm})")
-        ax.axvline(x=fc_cutoff, color='firebrick', linestyle=':', linewidth=1.5)
-        ax.axvline(x=-fc_cutoff, color='steelblue', linestyle=':', linewidth=1.5)
-        ax.axhline(y=-np.log10(p_cutoff), color='black', linestyle=':', linewidth=1.5)
-
-        target_markers = ['*', '^', 'D', 's']
-        target_colors = ['gold', 'lime', 'magenta', 'cyan']
-        for idx, target in enumerate(highlight_genes):
-            if target in v_df['Gene'].values:
-                row = v_df[v_df['Gene'] == target].iloc[0]
-                ax.scatter(
-                    row['Log2FC'],
-                    row['neg_log10_fdr'],
-                    color=target_colors[idx % len(target_colors)],
-                    marker=target_markers[idx % len(target_markers)],
-                    s=120,
-                    edgecolor='black',
-                    linewidth=1,
-                    zorder=10,
-                )
-                ax.text(
-                    row['Log2FC'] + (0.08 if row['Log2FC'] >= 0 else -0.08),
-                    row['neg_log10_fdr'],
-                    str(row['Gene']),
-                    fontsize=7,
-                    color='black',
-                    fontweight='bold',
-                    va='bottom',
-                    ha='left' if row['Log2FC'] >= 0 else 'right',
-                    zorder=11,
-                )
-
-        ax.set_xlabel(r'$\log_2(\text{Fold Change})$ (GALD vs Control)')
-        ax.set_ylabel(r'$-\log_{10}(\text{Permutation FDR})$')
-        pdf_obj.savefig(fig, bbox_inches='tight')
-        plt.close(fig)
-
-    return sig['Gene'].tolist(), top_hits, hl_hits
-
-
-# ==========================================
-# 3. FISHER'S EXACT TEST (PRESENCE/ABSENCE + BH-FDR)
-# ==========================================
-# ==========================================
-# 3. FISHER'S EXACT TEST (PRESENCE/ABSENCE, RAW P-VALUE)
-# ==========================================
-def analyze_fisher(wide_pres, c_samps, k_samps, subset_name, p_cutoff, highlight_genes):
     """
-    One-sided Fisher's Exact Test (GALD > Control) on protein presence/absence.
+    One-sided Fisher's Exact Test (GALD > Control) on protein presence/absence,
+    augmented with pre-imputation GALD log2 intensity benchmarking and explicit
+    tracking of proteins filtered out of the quantitative Volcano arm.
 
     DESIGN NOTE FOR REVIEWERS (INTENTIONAL STATISTICAL CHOICE):
     BH-FDR correction is intentionally NOT applied to Fisher's Exact Test p-values.
@@ -288,20 +241,22 @@ def analyze_fisher(wide_pres, c_samps, k_samps, subset_name, p_cutoff, highlight
     positives are controlled downstream by requiring replication across >=2
     independent MS runs AND concordance across both search engines (MaxQuant
     and FragPipe). Directional enrichment is strictly verified by group
-    proportions (cp / n_c > kp / n_k) rather than raw counts.
+    proportions (cp / n_c > kp / n_k) rather than raw counts, and ties among
+    discrete p-values are broken by descending GALD_Mean_Log2Int so high-signal
+    GALD-exclusive proteins are never buried.
     """
     n_c = len(c_samps)
     n_k = len(k_samps)
     if wide_pres.empty or n_c == 0 or n_k == 0:
-        return [], pd.DataFrame(), [], []
+        return [], pd.DataFrame(), [], [], pd.DataFrame()
 
-    c_counts = wide_pres[c_samps].notna().sum(axis=1).astype(int)
-    k_counts = wide_pres[k_samps].notna().sum(axis=1).astype(int)
+    pres_stats, subset_avg_log2 = _compute_gald_intensity_stats(wide_pres, c_samps, k_samps)
+    volcano_gene_set = set(volcano_genes) if volcano_genes is not None else None
 
     records = []
     for gene in wide_pres.index:
-        cp = int(c_counts.loc[gene])
-        kp = int(k_counts.loc[gene])
+        cp = int(pres_stats.loc[gene, 'GALD_sample_presence'])
+        kp = int(pres_stats.loc[gene, 'Non-GALD_sample_presence'])
 
         # Only test proteins with missingness (exclude 0% or 100% across both groups)
         if (cp + kp) == 0 or (cp + kp) == (n_c + n_k):
@@ -318,17 +273,36 @@ def analyze_fisher(wide_pres, c_samps, k_samps, subset_name, p_cutoff, highlight
             'Non-GALD_sample_presence': kp,
             'GALD_prop': cp / n_c,
             'Non-GALD_prop': kp / n_k,
+            'GALD_Mean_Log2Int': pres_stats.loc[gene, 'GALD_Mean_Log2Int'],
+            'Subset_GALD_Avg_Log2Int': subset_avg_log2,
+            'Above_Avg_GALD_Int': bool(pres_stats.loc[gene, 'Above_Avg_GALD_Int']),
+            'Exclusivity': pres_stats.loc[gene, 'Exclusivity'],
+            'Volcano_Filtered_Out': (gene not in volcano_gene_set) if volcano_gene_set is not None else False,
         })
 
     if not records:
-        return [], pd.DataFrame(), [], []
+        return [], pd.DataFrame(), [], [], pd.DataFrame()
 
     f_df = pd.DataFrame(records)
 
-    # Intentionally gate on raw p-value (see DESIGN NOTE above) + proportion direction
+    # Gate on raw p-value + proportion direction; break p-value ties by highest GALD intensity
     sig = (
         f_df[(f_df['p_value'] < p_cutoff) & (f_df['GALD_prop'] > f_df['Non-GALD_prop'])]
-        .sort_values(by='p_value')
+        .sort_values(by=['p_value', 'GALD_Mean_Log2Int'], ascending=[True, False], na_position='last')
+        .copy()
+    )
+
+    # Borderline safeguard watchlist: Volcano-filtered, <=1 control detection, above-avg GALD intensity, p in [p_cutoff, watchlist_p_cutoff)
+    watchlist = (
+        f_df[
+            (f_df['p_value'] >= p_cutoff)
+            & (f_df['p_value'] < watchlist_p_cutoff)
+            & (f_df['GALD_prop'] > f_df['Non-GALD_prop'])
+            & (f_df['Volcano_Filtered_Out'])
+            & (f_df['Non-GALD_sample_presence'] <= 1)
+            & (f_df['Above_Avg_GALD_Int'])
+        ]
+        .sort_values(by=['p_value', 'GALD_Mean_Log2Int'], ascending=[True, False], na_position='last')
         .copy()
     )
 
@@ -336,9 +310,12 @@ def analyze_fisher(wide_pres, c_samps, k_samps, subset_name, p_cutoff, highlight
     hl_hits = [g for g in highlight_genes if g in sig['Gene'].values]
     details = [f"{subset_name}(Fisher)" for _ in range(len(sig))]
 
-    out_cols = ['Gene', 'p_value', 'GALD_sample_presence', 'Non-GALD_sample_presence']
-    return details, sig[out_cols], top_hits, hl_hits
-
+    out_cols = [
+        'Gene', 'p_value', 'GALD_sample_presence', 'Non-GALD_sample_presence',
+        'GALD_Mean_Log2Int', 'Subset_GALD_Avg_Log2Int', 'Above_Avg_GALD_Int',
+        'Exclusivity', 'Volcano_Filtered_Out',
+    ]
+    return details, sig[out_cols], top_hits, hl_hits, watchlist[out_cols]
 
 # ==========================================
 # 4. PRINCIPAL COMPONENT ANALYSIS (MEAN-CENTERED)

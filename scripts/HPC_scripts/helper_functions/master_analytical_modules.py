@@ -1,22 +1,23 @@
 # Master Analytical Modules: Volcano, Fisher, PCA, Random Forest, and Paired Background Testing
 
+import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from joblib import Parallel, delayed
 from scipy.stats import fisher_exact, ttest_1samp, ttest_ind
 from statsmodels.stats.multitest import multipletests
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
 from sklearn.model_selection import RepeatedStratifiedKFold
-from sklearn.preprocessing import StandardScaler
 
 from helper_functions.master_data_handlers import (
     _select_representative_protein_groups,
     get_gald_peptide_interval,
+    impute_perseus,
 )
-
 try:
     from adjustText import adjust_text
 except ImportError:
@@ -384,27 +385,33 @@ def analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_obj, seed):
 
 
 # ==========================================
-# 5. RANDOM FOREST (REPEATED STRATIFIED CV + GATING)
+# 5. RANDOM FOREST (LEAK-FREE IN-FOLD FILTERING + FAST REPEATED CV)
 # ==========================================
 def analyze_rf(
-    imputed_df,
+    wide_pres,
     s_to_g,
     subset_name,
     highlight_genes,
     seed,
     n_splits=5,
-    n_repeats=20,
+    n_repeats=10,
     min_bal_acc=0.60,
+    min_group_frac=0.5,
+    n_estimators=200,
+    n_jobs=None,
 ):
-    clean_df = imputed_df.dropna(axis=0)
-    c_samps = [s for s in clean_df.columns if s_to_g[s] == 'GALD']
-    k_samps = [s for s in clean_df.columns if s_to_g[s] != 'GALD']
-
-    if clean_df.shape[0] == 0 or len(c_samps) == 0 or len(k_samps) == 0:
+    if wide_pres is None or wide_pres.empty:
         return [], [], []
 
-    X_raw = clean_df.T.values
-    y_bin = np.array([1 if s_to_g[s] == 'GALD' else 0 for s in clean_df.columns])
+    valid_cols = [s for s in wide_pres.columns if s in s_to_g]
+    if not valid_cols:
+        return [], [], []
+
+    pres_df = wide_pres[valid_cols].where(wide_pres[valid_cols] > 0).dropna(how='all', axis=0)
+    if pres_df.empty:
+        return [], [], []
+
+    y_bin = np.array([1 if s_to_g[s] == 'GALD' else 0 for s in pres_df.columns], dtype=np.int32)
     class_counts = np.bincount(y_bin, minlength=2)
     min_class_count = int(class_counts.min())
 
@@ -412,50 +419,104 @@ def analyze_rf(
         print(f"      * RF skipped [{subset_name}]: insufficient samples per class (min_class={min_class_count})")
         return [], [], []
 
+    # Pre-compute boolean presence mask and per-sample Perseus imputation once.
+    # Because Perseus imputation uses only each sample's own observed distribution,
+    # running it on wide_pres before CV introduces no label or train/test leakage.
+    pres_mask = pres_df.notna().T.to_numpy(dtype=bool, copy=False)
+    imputed_all = impute_perseus(pres_df, seed)
+    X_all = np.ascontiguousarray(imputed_all.T.to_numpy(dtype=np.float32))
+    genes = pres_df.index.to_numpy()
+    n_genes = len(genes)
+
     eff_splits = min(n_splits, min_class_count)
     rskf = RepeatedStratifiedKFold(n_splits=eff_splits, n_repeats=n_repeats, random_state=seed)
+    splits = list(rskf.split(X_all, y_bin))
 
-    fold_accs = []
-    fold_bal_accs = []
-    fold_imps = np.zeros((eff_splits * n_repeats, clean_df.shape[0]), dtype=float)
-    fold_gald_up = np.zeros((eff_splits * n_repeats, clean_df.shape[0]), dtype=bool)
+    if n_jobs is None:
+        alloc = (
+            os.environ.get("SLURM_CPUS_PER_TASK")
+            or os.environ.get("LSB_DJOB_NUMPROC")
+            or os.cpu_count()
+            or 1
+        )
+        n_jobs = min(int(alloc), 8)
 
-    for fold_idx, (train_idx, test_idx) in enumerate(rskf.split(X_raw, y_bin)):
-        X_train_raw, X_test_raw = X_raw[train_idx], X_raw[test_idx]
-        y_train, y_test = y_bin[train_idx], y_bin[test_idx]
+    def _run_fold(fold_idx, train_idx, test_idx):
+        y_train = y_bin[train_idx]
+        y_test = y_bin[test_idx]
 
-        # Directional check computed strictly on training fold (no test leakage)
-        gald_mean_tr = X_train_raw[y_train == 1].mean(axis=0)
-        ctrl_mean_tr = X_train_raw[y_train == 0].mean(axis=0)
-        fold_gald_up[fold_idx] = gald_mean_tr > ctrl_mean_tr
+        # Leak-free group completeness filter computed strictly on training fold
+        tr_pres = pres_mask[train_idx]
+        c_tr = (y_train == 1)
+        k_tr = (y_train == 0)
 
-        # Scale strictly on training fold
-        scaler = StandardScaler()
-        X_train = scaler.fit_transform(X_train_raw)
-        X_test = scaler.transform(X_test_raw)
+        min_c = max(2, int(np.ceil(c_tr.sum() * min_group_frac)))
+        min_k = max(2, int(np.ceil(k_tr.sum() * min_group_frac)))
 
+        keep_mask = (
+            (tr_pres[c_tr].sum(axis=0) >= min_c)
+            | (tr_pres[k_tr].sum(axis=0) >= min_k)
+        )
+        if not keep_mask.any():
+            return None
+
+        X_train = X_all[train_idx][:, keep_mask]
+        X_test = X_all[test_idx][:, keep_mask]
+
+        # Directional check strictly on training fold
+        gald_up_kept = X_train[c_tr].mean(axis=0) > X_train[k_tr].mean(axis=0)
+
+        # Random Forests are scale-invariant (no StandardScaler needed);
+        # n_jobs=1 avoids thread thrashing while outer CV runs in parallel.
         rf = RandomForestClassifier(
-            n_estimators=300,
+            n_estimators=n_estimators,
             random_state=seed + fold_idx,
             class_weight='balanced',
-            n_jobs=-1,
+            n_jobs=1,
         )
         rf.fit(X_train, y_train)
         y_pred = rf.predict(X_test)
 
-        fold_accs.append(accuracy_score(y_test, y_pred))
-        fold_bal_accs.append(balanced_accuracy_score(y_test, y_pred))
-        fold_imps[fold_idx] = rf.feature_importances_
+        return (
+            accuracy_score(y_test, y_pred),
+            balanced_accuracy_score(y_test, y_pred),
+            keep_mask,
+            rf.feature_importances_,
+            gald_up_kept,
+        )
 
-    mean_acc, sd_acc = float(np.mean(fold_accs)), float(np.std(fold_accs, ddof=1))
-    mean_bacc, sd_bacc = float(np.mean(fold_bal_accs)), float(np.std(fold_bal_accs, ddof=1))
+    # Thread-based parallelism: Cython RF releases the GIL and avoids Matplotlib fork deadlocks
+    results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(_run_fold)(fold_idx, train_idx, test_idx)
+        for fold_idx, (train_idx, test_idx) in enumerate(splits)
+    )
+    results = [r for r in results if r is not None]
+
+    if not results:
+        print(f"      * RF skipped [{subset_name}]: no features passed in-fold completeness filter")
+        return [], [], []
+
+    n_valid = len(results)
+    fold_accs = np.empty(n_valid, dtype=float)
+    fold_bal_accs = np.empty(n_valid, dtype=float)
+    imp_sum = np.zeros(n_genes, dtype=float)
+    gald_up_count = np.zeros(n_genes, dtype=int)
+
+    for i, (acc, bacc, keep_mask, feat_imp, gald_up_kept) in enumerate(results):
+        fold_accs[i] = acc
+        fold_bal_accs[i] = bacc
+        imp_sum[keep_mask] += feat_imp
+        gald_up_count[keep_mask] += gald_up_kept.astype(int)
+
+    ddof = 1 if n_valid > 1 else 0
+    mean_acc, sd_acc = float(fold_accs.mean()), float(fold_accs.std(ddof=ddof))
+    mean_bacc, sd_bacc = float(fold_bal_accs.mean()), float(fold_bal_accs.std(ddof=ddof))
 
     print(
         f"      * RF Repeated CV [{subset_name}] ({eff_splits}x{n_repeats} folds, n={len(y_bin)}): "
         f"Acc={mean_acc:.3f}±{sd_acc:.3f} | BalAcc={mean_bacc:.3f}±{sd_bacc:.3f}"
     )
 
-    # Gate: do not return feature hits if CV balanced accuracy is at/near chance
     if mean_bacc < min_bal_acc:
         print(
             f"      * RF gated [{subset_name}]: BalAcc {mean_bacc:.3f} < {min_bal_acc:.2f} "
@@ -463,16 +524,13 @@ def analyze_rf(
         )
         return [], [], []
 
-    mean_imp = fold_imps.mean(axis=0)
-    gald_up_frac = fold_gald_up.mean(axis=0)
-
     imp_df = pd.DataFrame({
-        'Gene': clean_df.index,
-        'Imp': mean_imp,
-        'GALD_Up_FoldFrac': gald_up_frac,
+        'Gene': genes,
+        'Imp': imp_sum / n_valid,
+        'GALD_Up_FoldFrac': gald_up_count / n_valid,
     })
 
-    # Require positive importance and GALD-abundant direction across training folds
+    # Automatically requires the gene to pass in-fold completeness AND be GALD-up in >50% of folds
     imp = (
         imp_df[(imp_df['Imp'] > 0) & (imp_df['GALD_Up_FoldFrac'] > 0.5)]
         .sort_values('Imp', ascending=False)
@@ -483,10 +541,6 @@ def analyze_rf(
     details = [f"{subset_name}(#{i + 1})" for i in range(len(imp))]
     return details, imp['Gene'].tolist(), hl_hits
 
-
-# ==========================================
-# 6. PAIRED LIVER VS. LB BACKGROUND TEST + DIRECT DiD
-# ==========================================
 # ==========================================
 # 6. PAIRED LIVER VS. LB BACKGROUND TEST + DIRECT DiD
 # ==========================================

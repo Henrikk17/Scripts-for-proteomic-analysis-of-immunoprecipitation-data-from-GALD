@@ -187,7 +187,7 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
             analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_pca, GLOBAL_SEED)
 
         if RUN_RF:
-            det, genes, hl_hits = analyze_rf(imputed_df, s_to_g, subset_name, HIGHLIGHT_GENES, GLOBAL_SEED)
+            det, genes, hl_hits = analyze_rf(wide_pres, s_to_g, subset_name, HIGHLIGHT_GENES, GLOBAL_SEED)
             for g, d in zip(genes, det):
                 res_rf.setdefault(g, []).append(d)
             if genes:

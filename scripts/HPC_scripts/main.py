@@ -5,6 +5,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')  # Strictly force headless mode to prevent Tkinter core dumps
 
+import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 
@@ -15,8 +16,9 @@ from helper_functions.master_data_handlers import (
 )
 from helper_functions.master_analytical_modules import (
     analyze_volcano, analyze_fisher, analyze_pca, analyze_rf,
-    analyze_background_ttest, export_engine_tables,
-    compile_master_summary, compile_above_avg_fisher_overlap
+    analyze_background_ttest, detect_high_intensity_exclusive,
+    export_engine_tables, compile_master_summary,
+    compile_above_avg_fisher_overlap, compile_high_intensity_exclusive_summary
 )
 from helper_functions.load_fragPipe_proteomic_data import load_fragPipe_proteomic_data
 
@@ -29,11 +31,17 @@ pd.set_option('display.width', 1000)
 # CONFIGURATION
 # ==========================================
 RUN_VOLCANO, RUN_FISHER, RUN_PCA, RUN_RF, RUN_BACKGROUND_TTEST, RUN_SUMMARY = True, True, True, True, True, True
+RUN_HIGH_INT_EXCLUSIVE = True
 
 USE_FDR = True
 P_CUTOFF = 0.05
 LOG2FC_CUTOFF = 1.0
 GLOBAL_SEED = 42
+
+HIGH_INT_MIN_GALD_DET = 2
+HIGH_INT_MAX_CTRL_DET = 1
+HIGH_INT_PCT_CUTOFF = 90.0
+HIGH_INT_Z_CUTOFF = 2.0
 
 HIGHLIGHT_GENES = ["CP", "HP", "TFRC", "TFR2"]
 
@@ -81,16 +89,20 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
 
     res_volcano, res_fisher, res_rf = {}, {}, {}
     res_fisher_above_avg, res_fisher_above_avg_details, res_highint_exclusive = {}, {}, {}
+    res_highint_excl_detector, res_gene_int_peak = {}, {}
     engine_enriched_records = []
     engine_watchlist_records = []
+    engine_hi_excl_records = []
 
     for subset_name, (df_prot, g_case, g_ctrl) in subsets_dict.items():
         print(f"\n  ➤ Processing subset: {subset_name}")
         wide_quant, wide_pres, c_samps, k_samps, s_to_g = prep_wide_df(df_prot, g_case, g_ctrl)
-        imputed_df = impute_perseus(wide_quant, GLOBAL_SEED)
+        imputed_df = impute_perseus(wide_quant, GLOBAL_SEED) if (RUN_VOLCANO or RUN_PCA) else pd.DataFrame()
         volcano_tested_genes = set(wide_quant.index)
 
         volcano_filtered_fisher_callout = []
+        fisher_sig_genes = set()
+        volcano_sig_genes = set()
 
         if RUN_FISHER:
             det, sig_df, tops, hl_hits, wl_df = analyze_fisher(
@@ -98,6 +110,7 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
                 volcano_genes=volcano_tested_genes,
             )
             genes = sig_df['Gene'].tolist() if not sig_df.empty else []
+            fisher_sig_genes = set(genes)
             for g, d in zip(genes, det):
                 res_fisher.setdefault(g, []).append(d)
             if tops:
@@ -163,6 +176,7 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
                 volcano_filtered_fisher_hits=volcano_filtered_fisher_callout,
             )
             genes = sig_df['Gene'].tolist() if not sig_df.empty else []
+            volcano_sig_genes = set(genes)
             for g, d in zip(genes, det):
                 res_volcano.setdefault(g, []).append(d)
             if tops:
@@ -183,10 +197,65 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
                 v_out['Analysis'] = 'Volcano'
                 engine_enriched_records.append(v_out)
 
+        if RUN_HIGH_INT_EXCLUSIVE:
+            hi_df, pres_stats = detect_high_intensity_exclusive(
+                wide_pres, c_samps, k_samps, subset_name,
+                volcano_genes=volcano_tested_genes,
+                fisher_sig_genes=fisher_sig_genes,
+                volcano_sig_genes=volcano_sig_genes,
+                min_gald_det=HIGH_INT_MIN_GALD_DET,
+                max_ctrl_det=HIGH_INT_MAX_CTRL_DET,
+                pct_cutoff=HIGH_INT_PCT_CUTOFF,
+                z_cutoff=HIGH_INT_Z_CUTOFF,
+            )
+
+            # Record peak GALD intensity percentile & robust Z per gene across subsets
+            if not pres_stats.empty:
+                for g_idx, r_ps in pres_stats.iterrows():
+                    pct_val = r_ps['GALD_Int_Pct']
+                    z_val = r_ps['GALD_Int_RobustZ']
+                    if pd.isna(pct_val) and pd.isna(z_val):
+                        continue
+                    cur = res_gene_int_peak.setdefault(g_idx, {'max_pct': np.nan, 'max_z': np.nan})
+                    if pd.notna(pct_val) and (pd.isna(cur['max_pct']) or pct_val > cur['max_pct']):
+                        cur['max_pct'] = float(pct_val)
+                    if pd.notna(z_val) and (pd.isna(cur['max_z']) or z_val > cur['max_z']):
+                        cur['max_z'] = float(z_val)
+
+            if not hi_df.empty:
+                engine_hi_excl_records.append(hi_df)
+                hi_tags = []
+                for _, r in hi_df.iterrows():
+                    g = r['Gene']
+                    pres_str = (
+                        f"{int(r['GALD_sample_presence'])}/{int(r['GALD_n'])} vs "
+                        f"{int(r['Non-GALD_sample_presence'])}/{int(r['Non-GALD_n'])}"
+                    )
+                    res_highint_excl_detector.setdefault(g, []).append({
+                        'subset': subset_name,
+                        'pres': pres_str,
+                        'gald_log2': float(r['GALD_Mean_Log2Int']),
+                        'ctrl_log2': float(r['Non-GALD_Mean_Log2Int']) if pd.notna(r['Non-GALD_Mean_Log2Int']) else np.nan,
+                        'int_pct': float(r['GALD_Int_Pct']),
+                        'robust_z': float(r['GALD_Int_RobustZ']) if pd.notna(r['GALD_Int_RobustZ']) else np.nan,
+                        'fisher_p': float(r['Fisher_Raw_p']) if pd.notna(r['Fisher_Raw_p']) else np.nan,
+                        'status': str(r['Main_Test_Status']),
+                    })
+                    z_txt = f"Z={r['GALD_Int_RobustZ']:.2f}" if pd.notna(r['GALD_Int_RobustZ']) else "Z=NA"
+                    hi_tags.append(
+                        f"{g} ({pres_str}, pct={r['GALD_Int_Pct']:.1f}%, {z_txt}, {r['Main_Test_Status']})"
+                    )
+                print(
+                    f"      * [High-Int Exclusive] Top 10% or Z>={HIGH_INT_Z_CUTOFF:.1f} & <={HIGH_INT_MAX_CTRL_DET} Ctrl (n={len(hi_df)}): "
+                    + ", ".join(hi_tags[:8])
+                    + (f" (+{len(hi_tags) - 8} more)" if len(hi_tags) > 8 else "")
+                )
+
         if RUN_PCA:
             analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_pca, GLOBAL_SEED)
 
         if RUN_RF:
+            # Pass pre-filter wide_pres so group completeness filtering happens strictly inside each CV fold
             det, genes, hl_hits = analyze_rf(wide_pres, s_to_g, subset_name, HIGHLIGHT_GENES, GLOBAL_SEED)
             for g, d in zip(genes, det):
                 res_rf.setdefault(g, []).append(d)
@@ -200,8 +269,14 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
     if RUN_PCA:
         pdf_pca.close()
 
-    # Sort and export per-engine enriched tables and borderline watchlist
-    export_engine_tables(engine_enriched_records, engine_watchlist_records, engine_name, OUT_DIR)
+    # Sort and export per-engine enriched tables, borderline watchlist, and high-intensity exclusive candidates
+    export_engine_tables(
+        engine_enriched_records,
+        engine_watchlist_records,
+        engine_name,
+        OUT_DIR,
+        engine_hi_excl_records=engine_hi_excl_records,
+    )
 
     return {
         'bg_class': bg_classes,
@@ -210,6 +285,8 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
         'fisher_above_avg': res_fisher_above_avg,
         'fisher_above_avg_details': res_fisher_above_avg_details,
         'highint_exclusive': {g: sorted(subs) for g, subs in res_highint_exclusive.items()},
+        'highint_excl_detector': res_highint_excl_detector,
+        'gene_int_peak': res_gene_int_peak,
         'rf_hits': res_rf,
     }
 
@@ -241,5 +318,8 @@ if __name__ == "__main__":
 
     if RUN_FISHER:
         compile_above_avg_fisher_overlap(mq_results, fp_results, mq_all, fp_all, OUT_DIR, HIGHLIGHT_GENES)
+
+    if RUN_HIGH_INT_EXCLUSIVE:
+        compile_high_intensity_exclusive_summary(mq_results, fp_results, mq_all, fp_all, OUT_DIR, HIGHLIGHT_GENES)
 
     print(f"\n📁 All plots successfully generated and saved to: {OUT_DIR.resolve()}")

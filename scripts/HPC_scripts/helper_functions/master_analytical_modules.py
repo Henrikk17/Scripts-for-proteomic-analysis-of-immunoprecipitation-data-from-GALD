@@ -1,4 +1,4 @@
-# Master Analytical Modules: Volcano, Fisher, PCA, Random Forest, and Paired Background Testing
+# Master Analytical Modules: Volcano, Fisher, PCA, Random Forest, Paired Background Testing, and High-Intensity Exclusive Detection
 
 import os
 from pathlib import Path
@@ -18,11 +18,11 @@ from helper_functions.master_data_handlers import (
     get_gald_peptide_interval,
     impute_perseus,
 )
+
 try:
     from adjustText import adjust_text
 except ImportError:
     adjust_text = None
-
 
 
 # ==========================================
@@ -30,9 +30,9 @@ except ImportError:
 # ==========================================
 def _compute_gald_intensity_stats(wide_pres, c_samps, k_samps):
     """
-    Compute per-gene GALD presence, control presence, raw-positive mean log2
-    intensity in GALD, and whether each gene is above the subset's average
-    GALD protein log2 intensity (prior to any imputation).
+    Compute per-gene GALD/control presence, raw-positive mean log2 intensity,
+    within-subset GALD intensity percentile and robust Z-score (median/MAD),
+    and exclusivity class prior to any imputation.
     """
     if wide_pres is None or wide_pres.empty or not c_samps:
         return pd.DataFrame(), np.nan
@@ -43,11 +43,29 @@ def _compute_gald_intensity_stats(wide_pres, c_samps, k_samps):
     valid_means = gene_mean_log2.dropna()
     subset_avg_log2 = float(valid_means.mean()) if not valid_means.empty else np.nan
 
+    if not valid_means.empty:
+        subset_med_log2 = float(valid_means.median())
+        mad = float(np.median(np.abs(valid_means.values - subset_med_log2)))
+        robust_scale = 1.4826 * mad
+        if not np.isfinite(robust_scale) or robust_scale <= 0:
+            robust_scale = float(valid_means.std(ddof=1)) if len(valid_means) > 1 else np.nan
+        if np.isfinite(robust_scale) and robust_scale > 0:
+            gald_robust_z = (gene_mean_log2 - subset_med_log2) / robust_scale
+        else:
+            gald_robust_z = pd.Series(np.nan, index=wide_pres.index, dtype=float)
+        gald_int_pct = gene_mean_log2.rank(pct=True, na_option='keep') * 100.0
+    else:
+        gald_robust_z = pd.Series(np.nan, index=wide_pres.index, dtype=float)
+        gald_int_pct = pd.Series(np.nan, index=wide_pres.index, dtype=float)
+
     c_counts = c_raw.notna().sum(axis=1).astype(int)
-    k_counts = (
-        wide_pres[k_samps].where(wide_pres[k_samps] > 0).notna().sum(axis=1).astype(int)
-        if k_samps else pd.Series(0, index=wide_pres.index, dtype=int)
-    )
+    if k_samps:
+        k_raw = wide_pres[k_samps].where(wide_pres[k_samps] > 0)
+        k_counts = k_raw.notna().sum(axis=1).astype(int)
+        k_mean_log2 = np.log2(k_raw).mean(axis=1, skipna=True)
+    else:
+        k_counts = pd.Series(0, index=wide_pres.index, dtype=int)
+        k_mean_log2 = pd.Series(np.nan, index=wide_pres.index, dtype=float)
 
     n_k = max(len(k_samps), 1)
     exclusivity = np.where(
@@ -64,12 +82,109 @@ def _compute_gald_intensity_stats(wide_pres, c_samps, k_samps):
         'GALD_sample_presence': c_counts,
         'Non-GALD_sample_presence': k_counts,
         'GALD_Mean_Log2Int': gene_mean_log2,
+        'Non-GALD_Mean_Log2Int': k_mean_log2,
+        'GALD_Int_Pct': gald_int_pct,
+        'GALD_Int_RobustZ': gald_robust_z,
         'Subset_GALD_Avg_Log2Int': subset_avg_log2,
         'Above_Avg_GALD_Int': gene_mean_log2 > subset_avg_log2 if np.isfinite(subset_avg_log2) else False,
         'Exclusivity': exclusivity,
     }, index=wide_pres.index)
 
     return stats_df, subset_avg_log2
+
+
+def detect_high_intensity_exclusive(
+    wide_pres,
+    c_samps,
+    k_samps,
+    subset_name,
+    volcano_genes=None,
+    fisher_sig_genes=None,
+    volcano_sig_genes=None,
+    min_gald_det=2,
+    max_ctrl_det=1,
+    pct_cutoff=90.0,
+    z_cutoff=2.0,
+):
+    """
+    Independent detector for high-abundance, GALD-exclusive (or <=1 control) proteins.
+    Operates directly on pre-filter wide_pres — independent of the 50% completeness
+    filter and Fisher/Volcano p-value cutoffs.
+    Returns (candidates_df, pres_stats_df).
+    """
+    n_c = len(c_samps)
+    n_k = len(k_samps)
+    if wide_pres is None or wide_pres.empty or n_c == 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    pres_stats, _ = _compute_gald_intensity_stats(wide_pres, c_samps, k_samps)
+    if pres_stats.empty:
+        return pd.DataFrame(), pres_stats
+
+    volc_tested = set(volcano_genes) if volcano_genes is not None else set()
+    f_sig = set(fisher_sig_genes) if fisher_sig_genes is not None else set()
+    v_sig = set(volcano_sig_genes) if volcano_sig_genes is not None else set()
+
+    gald_prop = pres_stats['GALD_sample_presence'] / n_c
+    ctrl_prop = pres_stats['Non-GALD_sample_presence'] / max(n_k, 1)
+
+    is_high_int = (
+        (pres_stats['GALD_Int_Pct'] >= pct_cutoff)
+        | (pres_stats['GALD_Int_RobustZ'] >= z_cutoff)
+    )
+    is_exclusive = (
+        (pres_stats['GALD_sample_presence'] >= min_gald_det)
+        & (pres_stats['Non-GALD_sample_presence'] <= max_ctrl_det)
+        & (gald_prop > ctrl_prop)
+    )
+
+    cand = pres_stats[is_high_int & is_exclusive].copy()
+    if cand.empty:
+        return pd.DataFrame(), pres_stats
+
+    rows = []
+    for gene, r in cand.iterrows():
+        cp = int(r['GALD_sample_presence'])
+        kp = int(r['Non-GALD_sample_presence'])
+        if n_k > 0 and 0 < (cp + kp) < (n_c + n_k):
+            _, p_f = fisher_exact([[cp, n_c - cp], [kp, n_k - kp]], alternative='greater')
+        else:
+            p_f = np.nan
+
+        in_f = gene in f_sig
+        in_v = gene in v_sig
+        if in_f and in_v:
+            status = "Fisher+Volcano"
+        elif in_f:
+            status = "Fisher only"
+        elif in_v:
+            status = "Volcano only"
+        else:
+            status = "MISSED (Neither)"
+
+        rows.append({
+            'Subset': subset_name,
+            'Gene': gene,
+            'GALD_sample_presence': cp,
+            'Non-GALD_sample_presence': kp,
+            'GALD_n': n_c,
+            'Non-GALD_n': n_k,
+            'GALD_Mean_Log2Int': float(r['GALD_Mean_Log2Int']),
+            'Non-GALD_Mean_Log2Int': float(r['Non-GALD_Mean_Log2Int']) if pd.notna(r['Non-GALD_Mean_Log2Int']) else np.nan,
+            'GALD_Int_Pct': float(r['GALD_Int_Pct']),
+            'GALD_Int_RobustZ': float(r['GALD_Int_RobustZ']) if pd.notna(r['GALD_Int_RobustZ']) else np.nan,
+            'Fisher_Raw_p': p_f,
+            'Exclusivity': str(r['Exclusivity']),
+            'Volcano_Filtered_Out': (gene not in volc_tested) if volcano_genes is not None else False,
+            'Main_Test_Status': status,
+        })
+
+    cand_df = pd.DataFrame(rows).sort_values(
+        by=['GALD_Int_RobustZ', 'GALD_Int_Pct', 'GALD_sample_presence'],
+        ascending=[False, False, False],
+        na_position='last',
+    )
+    return cand_df, pres_stats
 
 
 # ==========================================
@@ -110,7 +225,7 @@ def analyze_volcano(
     sig = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'] >= fc_cutoff)].copy()
     down = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'] <= -fc_cutoff)].copy()
 
-    # Attach pre-imputation presence, GALD intensity, and exclusivity context
+    # Attach pre-imputation presence, GALD intensity, percentile/Z-score, and exclusivity context
     if wide_pres is not None and not wide_pres.empty and not sig.empty:
         pres_stats, _ = _compute_gald_intensity_stats(wide_pres, c_samps, k_samps)
         if not pres_stats.empty:
@@ -278,6 +393,9 @@ def analyze_fisher(
             'GALD_prop': cp / n_c,
             'Non-GALD_prop': kp / n_k,
             'GALD_Mean_Log2Int': pres_stats.loc[gene, 'GALD_Mean_Log2Int'],
+            'Non-GALD_Mean_Log2Int': pres_stats.loc[gene, 'Non-GALD_Mean_Log2Int'],
+            'GALD_Int_Pct': pres_stats.loc[gene, 'GALD_Int_Pct'],
+            'GALD_Int_RobustZ': pres_stats.loc[gene, 'GALD_Int_RobustZ'],
             'Subset_GALD_Avg_Log2Int': subset_avg_log2,
             'Above_Avg_GALD_Int': bool(pres_stats.loc[gene, 'Above_Avg_GALD_Int']),
             'Exclusivity': pres_stats.loc[gene, 'Exclusivity'],
@@ -316,10 +434,13 @@ def analyze_fisher(
 
     out_cols = [
         'Gene', 'p_value', 'GALD_sample_presence', 'Non-GALD_sample_presence',
-        'GALD_Mean_Log2Int', 'Subset_GALD_Avg_Log2Int', 'Above_Avg_GALD_Int',
+        'GALD_Mean_Log2Int', 'Non-GALD_Mean_Log2Int',
+        'GALD_Int_Pct', 'GALD_Int_RobustZ',
+        'Subset_GALD_Avg_Log2Int', 'Above_Avg_GALD_Int',
         'Exclusivity', 'Volcano_Filtered_Out',
     ]
     return details, sig[out_cols], top_hits, hl_hits, watchlist[out_cols]
+
 
 # ==========================================
 # 4. PRINCIPAL COMPONENT ANALYSIS (MEAN-CENTERED)
@@ -387,6 +508,19 @@ def analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_obj, seed):
 # ==========================================
 # 5. RANDOM FOREST (LEAK-FREE IN-FOLD FILTERING + FAST REPEATED CV)
 # ==========================================
+def _resolve_rf_n_jobs(n_jobs):
+    if n_jobs is not None:
+        return max(1, int(n_jobs))
+    for env_key in ("SLURM_CPUS_PER_TASK", "LSB_DJOB_NUMPROC"):
+        raw = os.environ.get(env_key)
+        if raw:
+            try:
+                return max(1, min(int(raw), 8))
+            except ValueError:
+                pass
+    return max(1, min(os.cpu_count() or 1, 8))
+
+
 def analyze_rf(
     wide_pres,
     s_to_g,
@@ -431,15 +565,7 @@ def analyze_rf(
     eff_splits = min(n_splits, min_class_count)
     rskf = RepeatedStratifiedKFold(n_splits=eff_splits, n_repeats=n_repeats, random_state=seed)
     splits = list(rskf.split(X_all, y_bin))
-
-    if n_jobs is None:
-        alloc = (
-            os.environ.get("SLURM_CPUS_PER_TASK")
-            or os.environ.get("LSB_DJOB_NUMPROC")
-            or os.cpu_count()
-            or 1
-        )
-        n_jobs = min(int(alloc), 8)
+    eff_jobs = _resolve_rf_n_jobs(n_jobs)
 
     def _run_fold(fold_idx, train_idx, test_idx):
         y_train = y_bin[train_idx]
@@ -486,7 +612,7 @@ def analyze_rf(
         )
 
     # Thread-based parallelism: Cython RF releases the GIL and avoids Matplotlib fork deadlocks
-    results = Parallel(n_jobs=n_jobs, prefer="threads")(
+    results = Parallel(n_jobs=eff_jobs, prefer="threads")(
         delayed(_run_fold)(fold_idx, train_idx, test_idx)
         for fold_idx, (train_idx, test_idx) in enumerate(splits)
     )
@@ -517,6 +643,7 @@ def analyze_rf(
         f"Acc={mean_acc:.3f}±{sd_acc:.3f} | BalAcc={mean_bacc:.3f}±{sd_bacc:.3f}"
     )
 
+    # Gate: do not return feature hits if CV balanced accuracy is at/near chance
     if mean_bacc < min_bal_acc:
         print(
             f"      * RF gated [{subset_name}]: BalAcc {mean_bacc:.3f} < {min_bal_acc:.2f} "
@@ -530,7 +657,7 @@ def analyze_rf(
         'GALD_Up_FoldFrac': gald_up_count / n_valid,
     })
 
-    # Automatically requires the gene to pass in-fold completeness AND be GALD-up in >50% of folds
+    # Require positive importance and GALD-abundant direction across training folds
     imp = (
         imp_df[(imp_df['Imp'] > 0) & (imp_df['GALD_Up_FoldFrac'] > 0.5)]
         .sort_values('Imp', ascending=False)
@@ -540,6 +667,7 @@ def analyze_rf(
     hl_hits = [g for g in highlight_genes if g in imp['Gene'].values]
     details = [f"{subset_name}(#{i + 1})" for i in range(len(imp))]
     return details, imp['Gene'].tolist(), hl_hits
+
 
 # ==========================================
 # 6. PAIRED LIVER VS. LB BACKGROUND TEST + DIRECT DiD
@@ -976,8 +1104,14 @@ def _exclude_lb_samples(pep_df):
     return df_filt[~lb_mask].copy()
 
 
-def export_engine_tables(engine_enriched_records, engine_watchlist_records, engine_name, out_dir):
-    """Clean, sort, and export per-engine enriched protein tables and the borderline exclusive watchlist."""
+def export_engine_tables(
+    engine_enriched_records,
+    engine_watchlist_records,
+    engine_name,
+    out_dir,
+    engine_hi_excl_records=None,
+):
+    """Clean, sort, and export per-engine enriched, watchlist, and high-intensity exclusive tables."""
     out_path = Path(out_dir)
 
     non_empty_records = [df_rec for df_rec in engine_enriched_records if not df_rec.empty]
@@ -986,12 +1120,18 @@ def export_engine_tables(engine_enriched_records, engine_watchlist_records, engi
         col_order = [
             'Subset', 'Analysis', 'Gene', 'Log2FC', 'p_value', 'FDR',
             'GALD_sample_presence', 'Non-GALD_sample_presence',
-            'GALD_Mean_Log2Int', 'Subset_GALD_Avg_Log2Int', 'Above_Avg_GALD_Int',
+            'GALD_Mean_Log2Int', 'Non-GALD_Mean_Log2Int',
+            'GALD_Int_Pct', 'GALD_Int_RobustZ',
+            'Subset_GALD_Avg_Log2Int', 'Above_Avg_GALD_Int',
             'Exclusivity', 'Volcano_Filtered_Out',
         ]
         ordered_cols = [c for c in col_order if c in df_out.columns]
 
-        for num_col in ['Log2FC', 'p_value', 'FDR', 'GALD_Mean_Log2Int', 'Subset_GALD_Avg_Log2Int']:
+        for num_col in [
+            'Log2FC', 'p_value', 'FDR',
+            'GALD_Mean_Log2Int', 'Non-GALD_Mean_Log2Int',
+            'GALD_Int_Pct', 'GALD_Int_RobustZ', 'Subset_GALD_Avg_Log2Int',
+        ]:
             if num_col in df_out.columns:
                 df_out[num_col] = pd.to_numeric(df_out[num_col], errors='coerce')
 
@@ -999,8 +1139,8 @@ def export_engine_tables(engine_enriched_records, engine_watchlist_records, engi
             if pres_col in df_out.columns:
                 df_out[pres_col] = pd.to_numeric(df_out[pres_col], errors='coerce').astype('Int64')
 
-        sort_cols = [c for c in ['Subset', 'Analysis', 'p_value', 'GALD_Mean_Log2Int'] if c in df_out.columns]
-        sort_asc = [False if c == 'GALD_Mean_Log2Int' else True for c in sort_cols]
+        sort_cols = [c for c in ['Subset', 'Analysis', 'p_value', 'GALD_Int_RobustZ'] if c in df_out.columns]
+        sort_asc = [False if c == 'GALD_Int_RobustZ' else True for c in sort_cols]
         df_out = df_out[ordered_cols].sort_values(by=sort_cols, ascending=sort_asc, na_position='last')
         df_out.to_csv(out_path / f"{engine_name}_Enriched_Proteins.txt", sep='\t', index=False)
 
@@ -1009,15 +1149,26 @@ def export_engine_tables(engine_enriched_records, engine_watchlist_records, engi
         wl_all = pd.concat(non_empty_wl, ignore_index=True)
         wl_cols = [
             'Subset', 'Gene', 'p_value', 'GALD_sample_presence', 'Non-GALD_sample_presence',
-            'GALD_Mean_Log2Int', 'Subset_GALD_Avg_Log2Int', 'Above_Avg_GALD_Int',
+            'GALD_Mean_Log2Int', 'Non-GALD_Mean_Log2Int', 'GALD_Int_Pct', 'GALD_Int_RobustZ',
+            'Subset_GALD_Avg_Log2Int', 'Above_Avg_GALD_Int',
             'Exclusivity', 'Volcano_Filtered_Out',
         ]
         wl_all = wl_all[[c for c in wl_cols if c in wl_all.columns]].sort_values(
-            by=['Subset', 'p_value', 'GALD_Mean_Log2Int'],
-            ascending=[True, True, False],
+            by=['Subset', 'GALD_Int_RobustZ', 'p_value'],
+            ascending=[True, False, True],
             na_position='last',
         )
         wl_all.to_csv(out_path / f"{engine_name}_VolcanoFiltered_Exclusive_Watchlist.tsv", sep='\t', index=False)
+
+    if engine_hi_excl_records:
+        non_empty_hi = [df_hi for df_hi in engine_hi_excl_records if not df_hi.empty]
+        if non_empty_hi:
+            hi_all = pd.concat(non_empty_hi, ignore_index=True).sort_values(
+                by=['GALD_Int_RobustZ', 'GALD_Int_Pct', 'GALD_sample_presence'],
+                ascending=[False, False, False],
+                na_position='last',
+            )
+            hi_all.to_csv(out_path / f"{engine_name}_HighInt_Exclusive_Candidates.tsv", sep='\t', index=False)
 
 
 def compile_master_summary(mq_res, fp_res, mq_all, fp_all, out_dir):
@@ -1042,6 +1193,11 @@ def compile_master_summary(mq_res, fp_res, mq_all, fp_all, out_dir):
     r6_mq_pep = _exclude_lb_samples(mq_all['run6_with_LB'].get('pep'))
     r6_fp_pep = _exclude_lb_samples(fp_all['run6_with_LB'].get('pep'))
 
+    mq_peaks = mq_res.get('gene_int_peak', {})
+    fp_peaks = fp_res.get('gene_int_peak', {})
+
+    fmt_f = lambda v, dec=1: f"{v:.{dec}f}" if (v is not None and np.isfinite(v)) else "-"
+
     summary_rows = []
     for g in valid_genes:
         v_mq = len(mq_res['volcano_hits'].get(g, []))
@@ -1059,6 +1215,9 @@ def compile_master_summary(mq_res, fp_res, mq_all, fp_all, out_dir):
         excl_mq = ",".join(sorted({s.split('_')[0] for s in mq_res.get('highint_exclusive', {}).get(g, [])})) or "-"
         excl_fp = ",".join(sorted({s.split('_')[0] for s in fp_res.get('highint_exclusive', {}).get(g, [])})) or "-"
 
+        mq_pk = mq_peaks.get(g, {})
+        fp_pk = fp_peaks.get(g, {})
+
         fmt = lambda x: str(x) if x > 0 else "-"
 
         r4_mq = get_gald_peptide_interval(mq_all['run4_no_LB'].get('pep'), g)
@@ -1073,6 +1232,8 @@ def compile_master_summary(mq_res, fp_res, mq_all, fp_all, out_dir):
         summary_rows.append({
             'Gene': g,
             'Independent_Runs(MQ|FP)': f"{mq_runs}|{fp_runs}",
+            'Peak_GALD_Pct(MQ|FP)': f"{fmt_f(mq_pk.get('max_pct'), 1)}|{fmt_f(fp_pk.get('max_pct'), 1)}",
+            'Peak_GALD_RobustZ(MQ|FP)': f"{fmt_f(mq_pk.get('max_z'), 2)}|{fmt_f(fp_pk.get('max_z'), 2)}",
             'GALD Peptide Interval': pep_string,
             'Volcano_FDR(MQ|FP)': f"{fmt(v_mq)}|{fmt(v_fp)}",
             'Fisher_RawP(MQ|FP)': f"{fmt(f_mq)}|{fmt(f_fp)}",
@@ -1168,3 +1329,140 @@ def compile_above_avg_fisher_overlap(mq_res, fp_res, mq_all, fp_all, out_dir, hi
     print(f"Found {len(overlap_df)} overlapping above-average GALD intensity Fisher hits:")
     print(overlap_df.to_string(index=False))
     print(f"Saved overlap table to: {out_file.resolve()}")
+
+
+def compile_high_intensity_exclusive_summary(mq_res, fp_res, mq_all, fp_all, out_dir, highlight_genes):
+    """
+    Compile a dedicated cross-engine table of Top-Intensity, GALD-Exclusive (<=1 Ctrl)
+    proteins — independent of the 50% completeness filter and p < 0.05 cutoff —
+    sorted by cross-engine concordance, then descending Robust Z-score and Percentile.
+    """
+    print(
+        "\n" + "=" * 70
+        + "\n🔥 HIGH-INTENSITY GALD-EXCLUSIVE DETECTOR (Top 10% or Z>=2.0 & <=1 Ctrl; Independent of 50% Filter / p<0.05)\n"
+        + "=" * 70
+    )
+
+    mq_map = mq_res.get('highint_excl_detector', {})
+    fp_map = fp_res.get('highint_excl_detector', {})
+    all_genes = sorted(set(mq_map.keys()) | set(fp_map.keys()))
+
+    out_file = Path(out_dir) / "MASTER_CrossEngine_HighInt_Exclusive.tsv"
+
+    if not all_genes:
+        print("No proteins met the High-Intensity GALD-Exclusive criteria in either engine.")
+        return
+
+    r6_mq_pep = _exclude_lb_samples(mq_all['run6_with_LB'].get('pep'))
+    r6_fp_pep = _exclude_lb_samples(fp_all['run6_with_LB'].get('pep'))
+
+    def _safe_max(entries, key):
+        vals = [e[key] for e in entries if e.get(key) is not None and np.isfinite(e[key])]
+        return float(max(vals)) if vals else np.nan
+
+    def _safe_mean(entries, key):
+        vals = [e[key] for e in entries if e.get(key) is not None and np.isfinite(e[key])]
+        return float(np.mean(vals)) if vals else np.nan
+
+    fmt_f = lambda v, dec=2: f"{v:.{dec}f}" if np.isfinite(v) else "-"
+
+    def _fmt_details(entries):
+        if not entries:
+            return "-"
+        parts = []
+        for e in entries:
+            p_str = f"p={e['fisher_p']:.3g}" if np.isfinite(e['fisher_p']) else "p=NA"
+            z_str = f"Z={e['robust_z']:.2f}" if np.isfinite(e['robust_z']) else "Z=NA"
+            parts.append(
+                f"{e['subset']}: {e['pres']} (pct={e['int_pct']:.1f}%, {z_str}, {p_str}, {e['status']})"
+            )
+        return "; ".join(parts)
+
+    def _summarize_status(entries):
+        if not entries:
+            return "-"
+        statuses = {e['status'] for e in entries}
+        if statuses == {"MISSED (Neither)"}:
+            return "MISSED (Neither)"
+        return "/".join(sorted(statuses))
+
+    rows = []
+    for g in all_genes:
+        mq_e = mq_map.get(g, [])
+        fp_e = fp_map.get(g, [])
+
+        in_mq, in_fp = bool(mq_e), bool(fp_e)
+        if in_mq and in_fp:
+            engine_support = "Both (MQ & FP)"
+            support_rank = 0
+        elif in_mq:
+            engine_support = "MaxQuant Only"
+            support_rank = 1
+        else:
+            engine_support = "FragPipe Only"
+            support_rank = 2
+
+        mq_runs = ",".join(sorted({e['subset'].split('_')[0] for e in mq_e})) or "-"
+        fp_runs = ",".join(sorted({e['subset'].split('_')[0] for e in fp_e})) or "-"
+
+        mq_max_z, fp_max_z = _safe_max(mq_e, 'robust_z'), _safe_max(fp_e, 'robust_z')
+        mq_max_pct, fp_max_pct = _safe_max(mq_e, 'int_pct'), _safe_max(fp_e, 'int_pct')
+        mq_max_int, fp_max_int = _safe_max(mq_e, 'gald_log2'), _safe_max(fp_e, 'gald_log2')
+        mq_ctrl_int, fp_ctrl_int = _safe_mean(mq_e, 'ctrl_log2'), _safe_mean(fp_e, 'ctrl_log2')
+
+        z_vals = [v for v in (mq_max_z, fp_max_z) if np.isfinite(v)]
+        pct_vals = [v for v in (mq_max_pct, fp_max_pct) if np.isfinite(v)]
+        sort_z = float(max(z_vals)) if z_vals else -np.inf
+        sort_pct = float(max(pct_vals)) if pct_vals else -np.inf
+
+        r4_mq = get_gald_peptide_interval(mq_all['run4_no_LB'].get('pep'), g)
+        r4_fp = get_gald_peptide_interval(fp_all['run4'].get('pep'), g)
+        r5_mq = get_gald_peptide_interval(mq_all['run5_no_LB'].get('pep'), g)
+        r5_fp = get_gald_peptide_interval(fp_all['run5'].get('pep'), g)
+        r6_mq = get_gald_peptide_interval(r6_mq_pep, g)
+        r6_fp = get_gald_peptide_interval(r6_fp_pep, g)
+        pep_string = f"[MQ/FP run 4: {r4_mq}/{r4_fp}, MQ/FP run 5: {r5_mq}/{r5_fp}, MQ/FP run 6: {r6_mq}/{r6_fp}]"
+
+        rows.append({
+            '_support_rank': support_rank,
+            '_sort_z': sort_z,
+            '_sort_pct': sort_pct,
+            'Gene': g,
+            'Candidate': "*" if g in highlight_genes else "",
+            'Engine_Support': engine_support,
+            'Independent_Runs(MQ|FP)': f"{mq_runs}|{fp_runs}",
+            'Max_GALD_RobustZ(MQ|FP)': f"{fmt_f(mq_max_z, 2)}|{fmt_f(fp_max_z, 2)}",
+            'Max_GALD_Int_Pct(MQ|FP)': f"{fmt_f(mq_max_pct, 1)}|{fmt_f(fp_max_pct, 1)}",
+            'Peak_GALD_Log2Int(MQ|FP)': f"{fmt_f(mq_max_int, 2)}|{fmt_f(fp_max_int, 2)}",
+            'Ctrl_Log2Int_IfDet(MQ|FP)': f"{fmt_f(mq_ctrl_int, 2)}|{fmt_f(fp_ctrl_int, 2)}",
+            'Main_Test_Status(MQ|FP)': f"{_summarize_status(mq_e)}|{_summarize_status(fp_e)}",
+            'GALD Peptide Interval': pep_string,
+            'Background_TTest(MQ)': mq_res['bg_class'].get(g, "Not Evaluated"),
+            'Background_TTest(FP)': fp_res['bg_class'].get(g, "Not Evaluated"),
+            'MQ_Details': _fmt_details(mq_e),
+            'FP_Details': _fmt_details(fp_e),
+        })
+
+    hi_df = (
+        pd.DataFrame(rows)
+        .sort_values(
+            by=['_support_rank', '_sort_z', '_sort_pct', 'Gene'],
+            ascending=[True, False, False, True],
+        )
+        .drop(columns=['_support_rank', '_sort_z', '_sort_pct'])
+    )
+
+    hi_df.to_csv(out_file, sep='\t', index=False)
+
+    n_both = int((hi_df['Engine_Support'] == 'Both (MQ & FP)').sum())
+    print(f"Found {len(hi_df)} High-Intensity GALD-Exclusive candidates ({n_both} concordant across BOTH engines):")
+    display_cols = [
+        'Gene', 'Candidate', 'Engine_Support', 'Independent_Runs(MQ|FP)',
+        'Max_GALD_RobustZ(MQ|FP)', 'Max_GALD_Int_Pct(MQ|FP)',
+        'Peak_GALD_Log2Int(MQ|FP)', 'Ctrl_Log2Int_IfDet(MQ|FP)',
+        'Main_Test_Status(MQ|FP)', 'Background_TTest(MQ)', 'Background_TTest(FP)',
+    ]
+    print(hi_df[display_cols].head(30).to_string(index=False))
+    if len(hi_df) > 30:
+        print(f"  ... (+{len(hi_df) - 30} additional single-engine rows saved to TSV)")
+    print(f"Saved High-Intensity Exclusive table to: {out_file.resolve()}")

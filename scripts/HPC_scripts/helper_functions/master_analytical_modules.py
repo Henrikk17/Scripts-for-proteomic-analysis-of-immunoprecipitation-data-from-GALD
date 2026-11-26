@@ -545,18 +545,40 @@ def analyze_fisher(
 # ==========================================
 # 4. PRINCIPAL COMPONENT ANALYSIS (MEAN-CENTERED)
 # ==========================================
-def analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_obj, seed):
+def analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_obj, seed, top_n=20):
     clean_df = imputed_df.dropna(axis=0)
     if clean_df.shape[0] < 2 or clean_df.shape[1] < 2:
-        return
+        return pd.DataFrame()
 
     samples = list(clean_df.columns)
+    genes = np.asarray(clean_df.index)
     X = clean_df.T.values
     X_centered = X - np.mean(X, axis=0, keepdims=True)
 
     pca = PCA(n_components=2, random_state=seed)
     coords = pca.fit_transform(X_centered)
     var_pct = pca.explained_variance_ratio_ * 100.0
+
+    # Extract top_n genes by absolute loading magnitude for PC1 and PC2
+    loading_rows = []
+    for pc_idx in range(pca.components_.shape[0]):
+        loadings = pca.components_[pc_idx]
+        abs_loadings = np.abs(loadings)
+        top_idx = np.argsort(abs_loadings)[::-1][:top_n]
+        for rank, g_idx in enumerate(top_idx, start=1):
+            val = float(loadings[g_idx])
+            loading_rows.append({
+                'Subset': subset_name,
+                'PC': f"PC{pc_idx + 1}",
+                'PC_Explained_Var_Pct': round(float(var_pct[pc_idx]), 2),
+                'Rank': rank,
+                'Gene': str(genes[g_idx]),
+                'Loading': val,
+                'Abs_Loading': abs(val),
+                'Direction': '+' if val >= 0 else '-',
+            })
+
+    loadings_df = pd.DataFrame(loading_rows)
 
     if pdf_obj:
         fig, ax = plt.subplots(figsize=(9, 7))
@@ -604,6 +626,7 @@ def analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_obj, seed):
         pdf_obj.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
+    return loadings_df
 
 # ==========================================
 # 5. RANDOM FOREST (LEAK-FREE IN-FOLD FILTERING + FAST REPEATED CV)
@@ -1268,6 +1291,7 @@ def export_engine_tables(
     engine_name,
     out_dir,
     engine_hi_excl_records=None,
+    engine_pca_loading_records=None,
 ):
     """Clean, sort, and export per-engine enriched, watchlist, and high-intensity exclusive tables."""
     out_path = Path(out_dir)
@@ -1327,6 +1351,17 @@ def export_engine_tables(
                 na_position='last',
             )
             hi_all.to_csv(out_path / f"{engine_name}_HighInt_Exclusive_Candidates.tsv", sep='\t', index=False)
+
+    if engine_pca_loading_records:
+        non_empty_pca = [df_pca for df_pca in engine_pca_loading_records if not df_pca.empty]
+        if non_empty_pca:
+            pca_all = pd.concat(non_empty_pca, ignore_index=True).sort_values(
+                by=['Subset', 'PC', 'Rank'],
+                ascending=[True, True, True],
+            )
+            pca_out = out_path / f"{engine_name}_PCA_Top20_Loadings.tsv"
+            pca_all.to_csv(pca_out, sep='\t', index=False)
+            print(f"    Saved PCA top-20 loadings to: {pca_out.resolve()}")
 
 
 def compile_master_summary(mq_res, fp_res, mq_all, fp_all, out_dir):

@@ -96,6 +96,7 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
     engine_enriched_records = []
     engine_watchlist_records = []
     engine_hi_excl_records = []
+    engine_pca_loading_records = []
 
     for subset_name, (df_prot, g_case, g_ctrl) in subsets_dict.items():
         print(f"\n  ➤ Processing subset: {subset_name}")
@@ -266,7 +267,9 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
                 )
 
         if RUN_PCA:
-            analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_pca, GLOBAL_SEED)
+            pca_load_df = analyze_pca(imputed_df, s_to_g, subset_name, engine_name, pdf_pca, GLOBAL_SEED, top_n=20)
+            if pca_load_df is not None and not pca_load_df.empty:
+                engine_pca_loading_records.append(pca_load_df)
 
         if RUN_RF:
             # Pass pre-filter wide_pres so group completeness filtering happens strictly inside each CV fold
@@ -290,6 +293,7 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
         engine_name,
         OUT_DIR,
         engine_hi_excl_records=engine_hi_excl_records,
+        engine_pca_loading_records=engine_pca_loading_records,
     )
 
     return {

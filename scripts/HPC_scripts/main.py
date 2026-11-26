@@ -38,6 +38,9 @@ P_CUTOFF = 0.05
 LOG2FC_CUTOFF = 1.0
 GLOBAL_SEED = 42
 
+LIMMA_MIN_OBS_PER_GROUP = 2
+RSCRIPT_BIN = "Rscript"  # Or full path, e.g. "/usr/bin/Rscript", if not on default PATH
+
 HIGH_INT_MIN_GALD_DET = 2
 HIGH_INT_MAX_CTRL_DET = 1
 HIGH_INT_PCT_CUTOFF = 90.0
@@ -97,8 +100,18 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
     for subset_name, (df_prot, g_case, g_ctrl) in subsets_dict.items():
         print(f"\n  ➤ Processing subset: {subset_name}")
         wide_quant, wide_pres, c_samps, k_samps, s_to_g = prep_wide_df(df_prot, g_case, g_ctrl)
-        imputed_df = impute_perseus(wide_quant, GLOBAL_SEED) if (RUN_VOLCANO or RUN_PCA) else pd.DataFrame()
-        volcano_tested_genes = set(wide_quant.index)
+        # Perseus imputation is only needed for PCA; limma Volcano runs directly on observed wide_pres
+        imputed_df = impute_perseus(wide_quant, GLOBAL_SEED) if RUN_PCA else pd.DataFrame()
+
+        if not wide_pres.empty and len(c_samps) >= 2 and len(k_samps) >= 2:
+            c_obs = wide_pres[c_samps].where(wide_pres[c_samps] > 0).notna().sum(axis=1)
+            k_obs = wide_pres[k_samps].where(wide_pres[k_samps] > 0).notna().sum(axis=1)
+            volcano_tested_genes = set(
+                wide_pres.index[(c_obs >= LIMMA_MIN_OBS_PER_GROUP) & (k_obs >= LIMMA_MIN_OBS_PER_GROUP)]
+            )
+        else:
+            volcano_tested_genes = set()
+
 
         volcano_filtered_fisher_callout = []
         fisher_sig_genes = set()
@@ -170,10 +183,11 @@ def run_engine_pipeline(subsets_dict, prot_with_lb, engine_name, bg_prot_overrid
 
         if RUN_VOLCANO:
             det, sig_df, tops, hl_hits = analyze_volcano(
-                imputed_df, c_samps, k_samps, subset_name, engine_name,
+                wide_pres, c_samps, k_samps, subset_name, engine_name,
                 pdf_volcano, USE_FDR, P_CUTOFF, LOG2FC_CUTOFF, HIGHLIGHT_GENES,
-                wide_pres=wide_pres,
                 volcano_filtered_fisher_hits=volcano_filtered_fisher_callout,
+                min_obs_per_group=LIMMA_MIN_OBS_PER_GROUP,
+                rscript_bin=RSCRIPT_BIN,
             )
             genes = sig_df['Gene'].tolist() if not sig_df.empty else []
             volcano_sig_genes = set(genes)

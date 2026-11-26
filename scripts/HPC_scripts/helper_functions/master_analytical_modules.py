@@ -12,6 +12,9 @@ from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
 from sklearn.model_selection import RepeatedStratifiedKFold
+import shutil
+import subprocess
+import tempfile
 
 from helper_functions.master_data_handlers import (
     _select_representative_protein_groups,
@@ -188,10 +191,111 @@ def detect_high_intensity_exclusive(
 
 
 # ==========================================
-# 1. VOLCANO PLOT (WELCH'S T-TEST + BH-FDR)
+# 1. VOLCANO PLOT (R LIMMA ON OBSERVED INTENSITIES + BH-FDR)
 # ==========================================
+_LIMMA_R_SCRIPT = r"""
+args <- commandArgs(trailingOnly = TRUE)
+expr_path <- args[1]
+meta_path <- args[2]
+out_path  <- args[3]
+
+suppressPackageStartupMessages(library(limma))
+
+expr_df <- read.delim(
+  expr_path, check.names = FALSE, row.names = 1,
+  stringsAsFactors = FALSE, quote = "", comment.char = ""
+)
+meta_df <- read.delim(
+  meta_path, check.names = FALSE,
+  stringsAsFactors = FALSE, quote = "", comment.char = ""
+)
+
+sample_ids <- as.character(meta_df$Sample)
+mat <- as.matrix(expr_df[, sample_ids, drop = FALSE])
+storage.mode(mat) <- "double"
+
+group <- factor(meta_df$Group, levels = c("Control", "GALD"))
+design <- model.matrix(~ group)
+
+fit <- lmFit(mat, design)
+use_trend  <- nrow(mat) >= 10
+use_robust <- requireNamespace("statmod", quietly = TRUE) && (nrow(mat) >= 10)
+fit <- eBayes(fit, trend = use_trend, robust = use_robust)
+
+tt <- topTable(fit, coef = "groupGALD", number = Inf, sort.by = "none", adjust.method = "BH")
+out_df <- data.frame(
+  Gene    = rownames(tt),
+  Log2FC  = tt$logFC,
+  AveExpr = tt$AveExpr,
+  t_stat  = tt$t,
+  p_value = tt$P.Value,
+  FDR     = tt$adj.P.Val,
+  B_stat  = tt$B,
+  stringsAsFactors = FALSE
+)
+write.table(out_df, file = out_path, sep = "\t", quote = FALSE, row.names = FALSE)
+"""
+
+
+def run_limma_r(wide_pres, c_samps, k_samps, min_obs_per_group=2, rscript_bin="Rscript"):
+    """
+    Run Bioconductor limma (lmFit + eBayes trend) via Rscript on un-imputed
+    observed log2 LFQ intensities (no Perseus imputation).
+    """
+    if wide_pres is None or wide_pres.empty or len(c_samps) < 2 or len(k_samps) < 2:
+        return pd.DataFrame()
+
+    if shutil.which(rscript_bin) is None:
+        raise FileNotFoundError(
+            f"'{rscript_bin}' not found in PATH. Load your HPC R module or set RSCRIPT_BIN in main.py."
+        )
+
+    all_samps = list(c_samps) + list(k_samps)
+    safe_df = wide_pres[all_samps].where(wide_pres[all_samps] > 0)
+
+    n_c_obs = safe_df[c_samps].notna().sum(axis=1)
+    n_k_obs = safe_df[k_samps].notna().sum(axis=1)
+    keep = (n_c_obs >= min_obs_per_group) & (n_k_obs >= min_obs_per_group)
+
+    if not keep.any():
+        return pd.DataFrame()
+
+    log2_df = np.log2(safe_df.loc[keep])
+    meta_df = pd.DataFrame({
+        "Sample": all_samps,
+        "Group": (["GALD"] * len(c_samps)) + (["Control"] * len(k_samps)),
+    })
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        expr_path = tmp / "expr_log2.tsv"
+        meta_path = tmp / "meta.tsv"
+        out_path = tmp / "limma_out.tsv"
+        script_path = tmp / "run_limma.R"
+
+        log2_df.to_csv(expr_path, sep="\t", na_rep="NA", index_label="Gene")
+        meta_df.to_csv(meta_path, sep="\t", index=False)
+        script_path.write_text(_LIMMA_R_SCRIPT, encoding="utf-8")
+
+        proc = subprocess.run(
+            [rscript_bin, str(script_path), str(expr_path), str(meta_path), str(out_path)],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"R limma failed (exit {proc.returncode}):\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+            )
+
+        res_df = pd.read_csv(out_path, sep="\t")
+
+    res_df["n_GALD_obs"] = res_df["Gene"].map(n_c_obs.to_dict()).astype(int)
+    res_df["n_Ctrl_obs"] = res_df["Gene"].map(n_k_obs.to_dict()).astype(int)
+    return res_df.dropna(subset=["Log2FC", "p_value", "FDR"]).copy()
+
+
 def analyze_volcano(
-    imputed_df,
+    wide_pres,
     c_samps,
     k_samps,
     subset_name,
@@ -201,24 +305,21 @@ def analyze_volcano(
     p_cutoff,
     fc_cutoff,
     highlight_genes,
-    wide_pres=None,
     volcano_filtered_fisher_hits=None,
+    min_obs_per_group=2,
+    rscript_bin="Rscript",
 ):
-    if imputed_df.empty or len(c_samps) < 2 or len(k_samps) < 2:
+    if wide_pres is None or wide_pres.empty or len(c_samps) < 2 or len(k_samps) < 2:
         return [], pd.DataFrame(), [], []
 
-    c_data = imputed_df[c_samps].values
-    k_data = imputed_df[k_samps].values
-    genes = imputed_df.index.values
-
-    log2fc = np.mean(c_data, axis=1) - np.mean(k_data, axis=1)
-    _, p_vals = ttest_ind(c_data, k_data, axis=1, equal_var=False)
-
-    v_df = pd.DataFrame({'Gene': genes, 'Log2FC': log2fc, 'p_value': p_vals}).dropna()
+    v_df = run_limma_r(
+        wide_pres, c_samps, k_samps,
+        min_obs_per_group=min_obs_per_group,
+        rscript_bin=rscript_bin,
+    )
     if v_df.empty:
         return [], pd.DataFrame(), [], []
 
-    v_df['FDR'] = multipletests(v_df['p_value'], method='fdr_bh')[1]
     stat = 'FDR' if use_fdr else 'p_value'
     v_df['neg_log10_stat'] = -np.log10(np.clip(v_df[stat].values, 1e-300, 1.0))
 
@@ -226,7 +327,7 @@ def analyze_volcano(
     down = v_df[(v_df[stat] < p_cutoff) & (v_df['Log2FC'] <= -fc_cutoff)].copy()
 
     # Attach pre-imputation presence, GALD intensity, percentile/Z-score, and exclusivity context
-    if wide_pres is not None and not wide_pres.empty and not sig.empty:
+    if not sig.empty:
         pres_stats, _ = _compute_gald_intensity_stats(wide_pres, c_samps, k_samps)
         if not pres_stats.empty:
             sig = sig.merge(pres_stats, left_on='Gene', right_index=True, how='left')
@@ -242,7 +343,7 @@ def analyze_volcano(
         ax.scatter(sig['Log2FC'], sig['neg_log10_stat'], alpha=0.8, color='firebrick', s=20, zorder=2)
         ax.scatter(down['Log2FC'], down['neg_log10_stat'], alpha=0.8, color='steelblue', s=20, zorder=2)
 
-        ax.set_title(f"{engine_name} Volcano: {subset_name}")
+        ax.set_title(f"{engine_name} limma Volcano (Observed-Only): {subset_name} (n={len(v_df)} proteins)")
         ax.axvline(x=fc_cutoff, color='firebrick', linestyle=':', linewidth=1.5)
         ax.axvline(x=-fc_cutoff, color='steelblue', linestyle=':', linewidth=1.5)
         ax.axhline(y=-np.log10(p_cutoff), color='black', linestyle=':', linewidth=1.5)
@@ -307,16 +408,16 @@ def analyze_volcano(
                 )
 
         y_label_text = r'$-\log_{10}(\text{FDR})$' if use_fdr else r'$-\log_{10}(\text{p-value})$'
-        ax.set_xlabel(r'$\log_2(\text{Fold Change})$ (GALD vs Control)')
+        ax.set_xlabel(r'$\log_2(\text{Fold Change})$ (GALD vs Control, Observed-Only limma)')
         ax.set_ylabel(y_label_text)
 
-        # Surface high-intensity Fisher hits that were filtered out of Volcano (<50% completeness)
+        # Surface high-intensity Fisher hits excluded from observed-only limma (<min_obs_per_group in one arm)
         if volcano_filtered_fisher_hits:
             max_show = 12
             shown = volcano_filtered_fisher_hits[:max_show]
             extra = len(volcano_filtered_fisher_hits) - len(shown)
             note = (
-                "Volcano-filtered (<50% completeness) but significant in Fisher w/ Above-Avg GALD intensity: "
+                f"Excluded from limma (<{min_obs_per_group} obs/group) but significant in Fisher w/ Above-Avg GALD intensity: "
                 + ", ".join(shown)
                 + (f" (+{extra} more)" if extra > 0 else "")
             )
@@ -331,7 +432,6 @@ def analyze_volcano(
 
     details = [f"{subset_name}(Up)" for _ in range(len(sig))]
     return details, sig.drop(columns=['neg_log10_stat']), top_hits, hl_hits
-
 
 # ==========================================
 # 3. FISHER'S EXACT TEST (PRESENCE/ABSENCE, RAW P-VALUE + GALD INTENSITY)

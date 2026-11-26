@@ -68,12 +68,9 @@ def _extract_subject_map(annot_df, annot_label):
         )
         return None
 
-    cleaned_subj = (
-        annot_df[matched_col]
-        .astype(str)
-        .str.strip()
-        .replace({'': np.nan, 'nan': np.nan, 'None': np.nan, 'none': np.nan, 'NA': np.nan, 'na': np.nan})
-    )
+    raw_subj = annot_df[matched_col].astype(str).str.strip()
+    cleaned_subj = raw_subj.where(~raw_subj.str.lower().isin({'', 'nan', 'none', 'na'}))
+
     sample_to_subject = dict(zip(annot_df['sample'].astype(str).str.strip(), cleaned_subj))
     n_valid = int(cleaned_subj.notna().sum())
     print(f"Mapped Subject_ID from annotation column '{matched_col}' ({n_valid}/{len(annot_df)} samples annotated).")

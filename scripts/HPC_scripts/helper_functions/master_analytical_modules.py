@@ -746,11 +746,8 @@ def analyze_background_ttest(
     )
 
     def _clean_subj_series(s):
-        return (
-            s.astype(str)
-            .str.strip()
-            .replace({'': np.nan, 'nan': np.nan, 'None': np.nan, 'none': np.nan, 'NA': np.nan, 'na': np.nan})
-        )
+        cleaned = s.astype(str).str.strip()
+        return cleaned.where(~cleaned.str.lower().isin({'', 'nan', 'none', 'na'}))
 
     subj_col = None
     for cand_col in ['Subject_ID', 'Subject', 'Donor_ID', 'Donor', 'Pair_ID', 'subject_id']:

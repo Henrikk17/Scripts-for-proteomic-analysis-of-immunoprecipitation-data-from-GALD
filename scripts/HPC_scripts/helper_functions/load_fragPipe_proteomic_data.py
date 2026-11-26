@@ -1,13 +1,11 @@
-#25/05-2026
+# 25/05-2026 (Updated: preserve Subject_ID from annotation table; LFQ-only)
 
-#Function for loading FragPipe output data (MaxQuant-Compatible & Auto-Extracting Sample IDs): 
+# Function for loading FragPipe output data (MaxQuant-Compatible & Auto-Extracting Sample IDs):
 
-####
 import pandas as pd
 import numpy as np
 import warnings
 from pathlib import Path
-####
 
 
 def _filter_contaminants_and_decoys(df, contam_pattern=r'contam|con__|^rev_'):
@@ -32,28 +30,55 @@ def _filter_contaminants_and_decoys(df, contam_pattern=r'contam|con__|^rev_'):
     return df
 
 
+def _extract_subject_map(annot_df, annot_label):
+    """Detect and standardize a subject/donor ID column from the annotation table."""
+    col_lookup = {c.strip().lower(): c for c in annot_df.columns}
+    candidates = ['subject_id', 'donor_id', 'pair_id', 'subject', 'donor', 'patient_id', 'individual']
+    matched_col = next((col_lookup[k] for k in candidates if k in col_lookup), None)
+
+    if matched_col is None:
+        print(
+            f"⚠️ Warning: No Subject_ID/Donor_ID column found in {annot_label} "
+            f"(columns: {list(annot_df.columns)}). Background pairing will fall back to sample-number offset."
+        )
+        return None
+
+    cleaned_subj = (
+        annot_df[matched_col]
+        .astype(str)
+        .str.strip()
+        .replace({'': np.nan, 'nan': np.nan, 'None': np.nan, 'none': np.nan, 'NA': np.nan, 'na': np.nan})
+    )
+    sample_to_subject = dict(zip(annot_df['sample'].astype(str).str.strip(), cleaned_subj))
+    n_valid = int(cleaned_subj.notna().sum())
+    print(f"Mapped Subject_ID from annotation column '{matched_col}' ({n_valid}/{len(annot_df)} samples annotated).")
+    return sample_to_subject
+
+
 def load_fragPipe_proteomic_data(ROOT, annotation_file):
     """
     Loads and processes proteomic files from the specified FragPipe root path.
-    Standardizes column names to perfectly match MaxQuant outputs and extracts clean sample IDs.
+    Standardizes column names to match MaxQuant outputs, extracts clean sample IDs,
+    and preserves Subject_ID from the annotation table.
     """
     print("--- Loading FragPipe proteomic output data ---")
-    
+
     # ==========================================
-    # 1. LOAD ANNOTATIONS 
+    # 1. LOAD ANNOTATIONS
     # ==========================================
-    annot_df = pd.read_csv(annotation_file, sep='\t')
+    annot_path = Path(annotation_file)
+    annot_df = pd.read_csv(annot_path, sep='\t')
     for col in ['sample', 'condition', 'sample_type']:
         if col in annot_df.columns:
             annot_df[col] = annot_df[col].astype(str).str.strip()
-    
-    # Create dictionaries, ensuring no sneaky spaces exist
+
     sample_to_group = dict(zip(annot_df['sample'], annot_df['condition']))
     sample_to_type = dict(zip(annot_df['sample'], annot_df['sample_type']))
+    sample_to_subject = _extract_subject_map(annot_df, annot_path.name)
 
     print(f"Loaded annotations: Found {len(sample_to_group)} total samples in annotation file.")
 
-    root_path = Path(ROOT) 
+    root_path = Path(ROOT)
     prot_file = root_path / "combined_protein.tsv"
     pep_file = root_path / "combined_peptide.tsv"
 
@@ -73,12 +98,12 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
     # --- Rename & Standardize Columns to Match MaxQuant ---
     if 'Description' in prot_df.columns and 'Protein Description' not in prot_df.columns:
         prot_df.rename(columns={'Description': 'Protein Description'}, inplace=True)
-        
+
     if 'Protein Group' not in prot_df.columns:
-        prot_df['Protein Group'] = prot_df['Protein'] 
-        
+        prot_df['Protein Group'] = prot_df['Protein']
+
     if 'Protein Name' not in prot_df.columns:
-        prot_df['Protein Name'] = prot_df['Protein'] #This might seem as redudant repition (which it also is!), be we do this in order to make it compatible with previously made MaxQuant loaders. 
+        prot_df['Protein Name'] = prot_df['Protein']
 
     # --- Dynamically grab FragPipe LFQ Columns ---
     lfq_cols_prot = [c for c in prot_df.columns if c.endswith('MaxLFQ Intensity')]
@@ -92,50 +117,48 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
         lfq_cols_prot = [c for c in prot_df.columns if c.endswith('Intensity') and not c.endswith('MaxLFQ Intensity')]
         suffix_prot = ' Intensity'
 
-    prot_id_vars_target = ['Protein', 'Protein Group', 'Gene', 'Protein Description', 'Protein Name', 'Protein Probability', 'Combined Total Peptides'] 
-    #Now also gets the peptide count
-
+    prot_id_vars_target = [
+        'Protein', 'Protein Group', 'Gene', 'Protein Description',
+        'Protein Name', 'Protein Probability', 'Combined Total Peptides'
+    ]
     prot_id_vars = [col for col in prot_id_vars_target if col in prot_df.columns]
-
-    # --- Setup Safe ID Variables ---
 
     # Melt into long format
     melted_prot = prot_df.melt(
-        id_vars=prot_id_vars, 
-        value_vars=lfq_cols_prot, 
-        var_name='Sample_Col', 
-        value_name='Razor Intensity' 
+        id_vars=prot_id_vars,
+        value_vars=lfq_cols_prot,
+        var_name='Sample_Col',
+        value_name='Razor Intensity'
     )
 
     # --- Clean & Extract Sample IDs ---
     raw_sample_names_prot = melted_prot['Sample_Col'].str.replace(suffix_prot, '', regex=False).str.strip()
-    
-    # Use a case-insensitive regex (?i) and make the trailing underscore optional
     extracted_ids_prot = raw_sample_names_prot.str.extract(r'(?i)_s(\d+)', expand=False)
-    
+
     if extracted_ids_prot.isna().any():
         failed_raw = raw_sample_names_prot[extracted_ids_prot.isna()].unique()
         raise ValueError(f"❌ Regex extraction failed! Could not find '_s##' in these protein files:\n{failed_raw}")
 
-    # Convert to integer to strip leading zeros, then back to string!
     melted_prot['Sample'] = 'sample_' + extracted_ids_prot.astype(int).astype(str)
-    
     melted_prot['Group'] = melted_prot['Sample'].map(sample_to_group)
     melted_prot['Sample_type'] = melted_prot['Sample'].map(sample_to_type)
+    melted_prot['Subject_ID'] = (
+        melted_prot['Sample'].map(sample_to_subject)
+        if sample_to_subject is not None else np.nan
+    )
 
     # --- SANITY CHECK ---
     unique_mapped_samples_prot = melted_prot['Sample'].unique()
     unique_annot_samples = annot_df['sample'].unique()
     missing_from_annot = set(unique_mapped_samples_prot) - set(unique_annot_samples)
-    
+
     if len(missing_from_annot) > 0:
         raise ValueError(f"❌ Mapping Error in combined_protein.tsv! Missing annotations for extracted IDs: {missing_from_annot}")
 
     # Drop zeroes and NaNs
-    master_prot_df = melted_prot[(melted_prot['Razor Intensity'].notna()) & 
+    master_prot_df = melted_prot[(melted_prot['Razor Intensity'].notna()) &
                                  (melted_prot['Razor Intensity'] > 0)].copy()
 
-    # Generate short ID
     master_prot_df['Protein_short'] = master_prot_df['Protein'].apply(
         lambda x: str(x).split('|')[1] if pd.notna(x) and '|' in str(x) else x
     )
@@ -150,10 +173,8 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
         warnings.simplefilter(action='ignore', category=pd.errors.DtypeWarning)
         pep_df = pd.read_csv(pep_file, sep='\t')
 
-    # --- Contaminant & Decoy Filtering ---
     pep_df = _filter_contaminants_and_decoys(pep_df, contam_pattern=contam_pattern)
 
-    # --- Rename & Standardize Columns to Match MaxQuant ---
     if 'Peptide' in pep_df.columns:
         pep_df.rename(columns={'Peptide': 'Peptide Sequence'}, inplace=True)
     elif 'Sequence' in pep_df.columns and 'Peptide Sequence' not in pep_df.columns:
@@ -161,11 +182,10 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
 
     if 'Protein Group' not in pep_df.columns:
         pep_df['Protein Group'] = pep_df['Protein']
-        
+
     if 'Protein Name' not in pep_df.columns:
         pep_df['Protein Name'] = pep_df['Protein']
 
-    # --- Grab Peptide Intensity Columns ---
     lfq_cols_pep = [c for c in pep_df.columns if c.endswith('MaxLFQ Intensity')]
     suffix_pep = ' MaxLFQ Intensity'
 
@@ -177,49 +197,43 @@ def load_fragPipe_proteomic_data(ROOT, annotation_file):
         lfq_cols_pep = [c for c in pep_df.columns if c.endswith('Intensity')]
         suffix_pep = ' Intensity'
 
-    # --- Setup Safe ID Variables ---
     pep_id_vars_target = ['Peptide Sequence', 'Protein', 'Protein Group', 'Gene', 'Protein Name', 'Peptide Probability']
     pep_id_vars = [col for col in pep_id_vars_target if col in pep_df.columns]
 
-    # --- Melt into long format ---
     melted_pep = pep_df.melt(
-        id_vars=pep_id_vars, 
-        value_vars=lfq_cols_pep, 
-        var_name='Sample_Col', 
+        id_vars=pep_id_vars,
+        value_vars=lfq_cols_pep,
+        var_name='Sample_Col',
         value_name='Razor Intensity'
     )
 
-    # --- Clean & Extract Sample IDs ---
     raw_sample_names_pep = melted_pep['Sample_Col'].str.replace(suffix_pep, '', regex=False).str.strip()
-    
     extracted_ids_pep = raw_sample_names_pep.str.extract(r'(?i)_s(\d+)', expand=False)
-    
+
     if extracted_ids_pep.isna().any():
         failed_raw = raw_sample_names_pep[extracted_ids_pep.isna()].unique()
         raise ValueError(f"❌ Regex extraction failed! Could not find '_s##' in these peptide files:\n{failed_raw}")
 
-    # Convert to integer to strip leading zeros, then back to string!
     melted_pep['Sample'] = 'sample_' + extracted_ids_pep.astype(int).astype(str)
-
     melted_pep['Group'] = melted_pep['Sample'].map(sample_to_group)
     melted_pep['Sample_type'] = melted_pep['Sample'].map(sample_to_type)
+    melted_pep['Subject_ID'] = (
+        melted_pep['Sample'].map(sample_to_subject)
+        if sample_to_subject is not None else np.nan
+    )
 
-    # --- SANITY CHECK ---
     unique_mapped_samples_pep = melted_pep['Sample'].unique()
     missing_from_annot_pep = set(unique_mapped_samples_pep) - set(unique_annot_samples)
-    
+
     if len(missing_from_annot_pep) > 0:
         raise ValueError(f"❌ Mapping Error in combined_peptide.tsv! Missing annotations for extracted IDs: {missing_from_annot_pep}")
 
-    # Drop zeroes and NaNs
-    master_pep_df = melted_pep[(melted_pep['Razor Intensity'].notna()) & 
+    master_pep_df = melted_pep[(melted_pep['Razor Intensity'].notna()) &
                                (melted_pep['Razor Intensity'] > 0)].copy()
 
-    # Add 'Protein Description' by mapping it from the protein file
     desc_mapping = dict(zip(prot_df['Protein'], prot_df['Protein Description']))
     master_pep_df['Protein Description'] = master_pep_df['Protein'].map(desc_mapping)
 
-    # Generate short ID
     master_pep_df['Protein_short'] = master_pep_df['Protein'].apply(
         lambda x: str(x).split('|')[1] if pd.notna(x) and '|' in str(x) else x
     )

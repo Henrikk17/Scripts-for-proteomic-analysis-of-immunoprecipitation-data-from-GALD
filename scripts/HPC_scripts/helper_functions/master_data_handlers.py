@@ -7,12 +7,25 @@ from helper_functions.load_maxQuant_proteomic_data import load_maxQuant_proteomi
 from helper_functions.load_fragPipe_proteomic_data import load_fragPipe_proteomic_data
 
 
-def get_fragpipe_imms_datasets(cache_dir, base_dir="~/results/LFQ_MBR_IM-MS"):
-    cache_file = cache_dir / "fp_imms_master_data.pkl"
-    if cache_file.exists():
-        with open(cache_file, "rb") as f:
-            return pickle.load(f)
+def _cache_has_subject_id(cached_dict, ref_key="run6_with_LB"):
+    """Verify cached protein tables include the preserved Subject_ID column."""
+    try:
+        ref_prot = cached_dict[ref_key]["prot"]
+        return ref_prot is not None and "Subject_ID" in ref_prot.columns
+    except Exception:
+        return False
 
+
+def get_fragpipe_imms_datasets(cache_dir, base_dir="~/results/LFQ_MBR_IM-MS", force_reload=False):
+    cache_file = cache_dir / "fp_imms_master_data.pkl"
+    if not force_reload and cache_file.exists():
+        with open(cache_file, "rb") as f:
+            cached = pickle.load(f)
+        if _cache_has_subject_id(cached):
+            return cached
+        print("♻️ Stale FragPipe cache detected (missing Subject_ID); rebuilding...")
+
+    
     base_path = Path(base_dir).expanduser()
     run_specs = {
         "run4": {"path": base_path / "run4_results", "annot": "../experiment_annotation/experiment_annotation_run4_R876.tsv"},
@@ -44,11 +57,14 @@ def get_fragpipe_imms_datasets(cache_dir, base_dir="~/results/LFQ_MBR_IM-MS"):
     return fp_data
 
 
-def get_maxquant_datasets(cache_dir, base_dir="~/DTU-GALD"):
+def get_maxquant_datasets(cache_dir, base_dir="~/DTU-GALD", force_reload=False):
     cache_file = cache_dir / "mq_master_data.pkl"
-    if cache_file.exists():
+    if not force_reload and cache_file.exists():
         with open(cache_file, "rb") as f:
-            return pickle.load(f)
+            cached = pickle.load(f)
+        if _cache_has_subject_id(cached):
+            return cached
+        print("♻️ Stale MaxQuant cache detected (missing Subject_ID); rebuilding...")
 
     run_specs = {
         "run4": {"req_id": "0876", "annot": "../experiment_annotation/experiment_annotation_run4_R876.tsv"},

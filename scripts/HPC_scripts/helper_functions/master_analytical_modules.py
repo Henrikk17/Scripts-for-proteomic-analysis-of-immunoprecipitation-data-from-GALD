@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from joblib import Parallel, delayed
-from scipy.stats import fisher_exact, ttest_1samp, ttest_ind
+from scipy.stats import binomtest, fisher_exact, ttest_1samp, ttest_ind
 from statsmodels.stats.multitest import multipletests
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
@@ -682,31 +682,32 @@ def analyze_background_ttest(
     min_liver_frac=0.5,
 ):
     """
-    Evaluation of Liver Lysate (non-LB) vs. Lysate Buffer (LB) separately within
-    GALD and non-GALD subjects, plus direct difference-in-differences
-    (Delta_GALD > Delta_NonGALD):
-      1) Presence/absence enrichment (clean targets absent or rare in LB) via
-         one-sided Fisher's Exact Test (raw p < p_thresh) + zero-LB rule.
-      2) Quantitative enrichment (detected in both Liver and LB) via
-         one-sided paired t-test with BH-FDR.
-      3) Direct GALD > Non-GALD specificity via one-sided Welch's t-test on
-         paired log2 differences (quantitative DiD, BH-FDR) and one-sided
-         Fisher's Exact Test on Liver-only pair proportions (presence/absence
-         DiD, raw p < p_thresh).
-
-    DESIGN NOTE FOR REVIEWERS (INTENTIONAL STATISTICAL CHOICE):
-    1. Fisher's Exact Test is intentionally used in place of McNemar's test for
-       the Liver vs. LB presence/absence check for methodological consistency
-       with analyze_fisher across the pipeline. Although Liver and LB samples
-       are subject-paired, treating the 2x2 detection counts with an unpaired
-       Fisher's Exact Test is a valid, conservative approximation under positive
-       within-subject correlation.
-    2. BH-FDR correction is intentionally NOT applied to Fisher's Exact Test
-       p-values (both within-cohort Liver vs. LB and presence/absence DiD).
-       Because sample sizes are small (GALD n=14, Non-GALD n=27), discrete
-       Fisher p-values inflate severely under BH adjustment, causing genuine
-       LB-absent liver proteins to be misclassified. BH-FDR IS retained for all
-       continuous t-tests (paired quantitative Liver vs. LB and quantitative DiD).
+    Paired LFQ evaluation of Liver Lysate (non-LB) vs. Lysate Buffer (LB)
+    separately within GALD and non-GALD subjects, plus direct
+    difference-in-differences (Delta_GALD > Delta_NonGALD):
+      - Pairing strictly uses preserved Subject_ID / Donor_ID metadata when
+        present, falling back to the l_num + 42 sample-number offset only with
+        an explicit warning.
+      - Tests:
+        1) Within-cohort presence/absence enrichment via exact one-sided
+           McNemar binomial test on discordant pairs:
+           binomtest(liver_only, liver_only + lb_only, 0.5, alternative='greater')
+           plus a zero-LB safeguard.
+        2) Within-cohort quantitative enrichment on co-detected pairs via
+           one-sided paired t-test with BH-FDR control.
+        3) Direct GALD > Non-GALD specificity via:
+           (a) Quantitative DiD: one-sided Welch's t-test on paired log2
+               differences (BH-FDR controlled).
+           (b) Clean Liver-only presence DiD: one-sided Fisher's exact test on
+               Liver-only (Liver+ & LB-) pair counts.
+           (c) Carryover-aware DiD ("GALD Liver+LB vs. Non-GALD all-absent/sparse"):
+               for proteins BH-FDR confirmed as quantitatively Liver > LB in
+               GALD (and not Liver-enriched in Non-GALD), tests GALD
+               Liver-enriched pairs (Liver-only OR co-detected with
+               diff >= fc_thresh) against total Non-GALD Liver detections via
+               one-sided Fisher's exact test so high-abundance targets with
+               trace LB carryover are not falsely marked unconfirmed when
+               Non-GALD has <2 co-detected pairs.
     """
     if prot_with_lb is None or prot_with_lb.empty:
         return {}
@@ -744,20 +745,23 @@ def analyze_background_ttest(
         if has_type else {}
     )
 
-    subj_col = next(
-        (c for c in ['Subject_ID', 'Subject', 'Donor_ID', 'Donor', 'Pair_ID', 'subject_id'] if c in df_clean.columns),
-        None
-    )
+    def _clean_subj_series(s):
+        return (
+            s.astype(str)
+            .str.strip()
+            .replace({'': np.nan, 'nan': np.nan, 'None': np.nan, 'none': np.nan, 'NA': np.nan, 'na': np.nan})
+        )
 
-    sample_to_group = (
-        df_clean.drop_duplicates('Sample_str')
-        .set_index('Sample_str')['Group_clean']
-        .to_dict()
-    )
+    subj_col = None
+    for cand_col in ['Subject_ID', 'Subject', 'Donor_ID', 'Donor', 'Pair_ID', 'subject_id']:
+        if cand_col in df_clean.columns and _clean_subj_series(df_clean[cand_col]).notna().any():
+            subj_col = cand_col
+            break
+
+    uniq_samples = df_clean.drop_duplicates('Sample_str')
+    sample_to_group = dict(zip(uniq_samples['Sample_str'], uniq_samples['Group_clean']))
     sample_to_subj = (
-        df_clean.drop_duplicates('Sample_str')
-        .set_index('Sample_str')[subj_col]
-        .to_dict()
+        dict(zip(uniq_samples['Sample_str'], _clean_subj_series(uniq_samples[subj_col])))
         if subj_col else {}
     )
 
@@ -798,7 +802,13 @@ def analyze_background_ttest(
     nongald_pairs = []
 
     def classify_cohort(l_col, b_col):
-        grp = str(sample_to_group.get(l_col, sample_to_group.get(b_col, ''))).strip().upper()
+        l_grp = str(sample_to_group.get(l_col, '')).strip()
+        b_grp = str(sample_to_group.get(b_col, '')).strip()
+        if l_grp and b_grp and l_grp.upper() != b_grp.upper():
+            raise ValueError(
+                f"❌ Background pairing mismatch: {l_col} ({l_grp}) paired with {b_col} ({b_grp})!"
+            )
+        grp = (l_grp or b_grp).upper()
         is_gald = (
             'GALD' in grp
             and 'SPOUSE' not in grp
@@ -815,15 +825,28 @@ def analyze_background_ttest(
         lb_by_subj = {
             str(sample_to_subj[b_col]).strip(): b_col
             for b_col in lb_cols
-            if pd.notna(sample_to_subj.get(b_col)) and str(sample_to_subj.get(b_col)).strip() != ''
+            if pd.notna(sample_to_subj.get(b_col))
         }
+        unpaired_liver = []
         for l_col in liver_cols:
             s_id = sample_to_subj.get(l_col)
-            if pd.notna(s_id) and str(s_id).strip() != '':
+            if pd.notna(s_id):
                 paired_lb = lb_by_subj.get(str(s_id).strip())
                 if paired_lb is not None:
                     classify_cohort(l_col, paired_lb)
+                    continue
+            unpaired_liver.append(l_col)
+        pairing_desc = f"Subject_ID ('{subj_col}')"
+        if unpaired_liver:
+            print(
+                f"    ⚠️ [{engine_name} Background] {len(unpaired_liver)} Liver sample(s) had no matching "
+                f"LB pair under '{subj_col}': {', '.join(unpaired_liver[:5])}"
+            )
     else:
+        print(
+            f"    ⚠️ [{engine_name} Background] Subject_ID column unavailable/empty; "
+            "falling back to sample-number offset (l_num + 42)."
+        )
         lb_by_num = {extract_num(c): c for c in lb_cols if extract_num(c) is not None}
         for l_col in liver_cols:
             l_num = extract_num(l_col)
@@ -831,6 +854,7 @@ def analyze_background_ttest(
                 paired_lb = lb_by_num.get(l_num + 42)
                 if paired_lb is not None:
                     classify_cohort(l_col, paired_lb)
+        pairing_desc = "fallback l_num+42"
 
     def run_paired_cohort(pairs):
         idx = wide_log2.index
@@ -841,7 +865,8 @@ def analyze_background_ttest(
         res['liver_only'] = 0
         res['lb_only'] = 0
         res['both_tested'] = 0
-        res['fisher_p'] = np.nan
+        res['enriched_pairs'] = 0
+        res['mcnemar_p'] = np.nan
         res['mean_fc'] = np.nan
         res['quant_p'] = np.nan
         res['quant_fdr'] = np.nan
@@ -865,29 +890,28 @@ def analyze_background_ttest(
         n_liver_only = (l_pres & ~b_pres).sum(axis=1)
         n_lb_only = (~l_pres & b_pres).sum(axis=1)
         n_both = (l_pres & b_pres).sum(axis=1)
+        n_both_enr = (l_pres & b_pres & (diffs >= fc_thresh)).sum(axis=1)
 
         res['liver_det'] = n_liver_det
         res['lb_det'] = n_lb_det
         res['liver_only'] = n_liver_only
         res['lb_only'] = n_lb_only
         res['both_tested'] = n_both
+        res['enriched_pairs'] = n_liver_only + n_both_enr
 
-        # Case 1: Presence/absence test via one-sided Fisher's Exact Test (unadjusted raw p; see DESIGN NOTE)
-        fisher_p = np.full(len(idx), np.nan, dtype=float)
+        # Case 1: Exact one-sided paired McNemar binomial test on discordant pairs
+        mcnemar_p = np.full(len(idx), np.nan, dtype=float)
         for i in range(len(idx)):
-            l_d = int(n_liver_det[i])
-            b_d = int(n_lb_det[i])
-            if 0 < (l_d + b_d) < (2 * n_total):
-                _, p_f = fisher_exact(
-                    [[l_d, n_total - l_d], [b_d, n_total - b_d]],
-                    alternative='greater',
-                )
-                fisher_p[i] = p_f
-        res['fisher_p'] = fisher_p
+            lo = int(n_liver_only[i])
+            bo = int(n_lb_only[i])
+            n_disc = lo + bo
+            if n_disc > 0:
+                mcnemar_p[i] = binomtest(lo, n_disc, 0.5, alternative='greater').pvalue
+        res['mcnemar_p'] = mcnemar_p
 
         min_liver_det = max(3, int(np.ceil(n_total * min_liver_frac)))
         res['sig_absent_lb'] = (
-            (res['fisher_p'].notna() & (res['fisher_p'] < p_thresh) & (res['liver_det'] > res['lb_det']))
+            (res['mcnemar_p'].notna() & (res['mcnemar_p'] < p_thresh) & (res['liver_only'] > res['lb_only']))
             | ((res['liver_det'] >= min_liver_det) & (res['lb_det'] == 0))
         )
 
@@ -933,12 +957,15 @@ def analyze_background_ttest(
     did_fc = np.full(n_genes, np.nan, dtype=float)
     did_quant_p = np.full(n_genes, np.nan, dtype=float)
     did_pres_p = np.full(n_genes, np.nan, dtype=float)
+    did_carryover_p = np.full(n_genes, np.nan, dtype=float)
 
     g_lo_arr = gald_res['liver_only'].values
     ng_lo_arr = nongald_res['liver_only'].values
+    g_enr_arr = gald_res['enriched_pairs'].values
+    ng_ld_arr = nongald_res['liver_det'].values
 
     for i in range(n_genes):
-        # Quantitative DiD: Welch's one-sided t-test on paired log2 differences (BH-FDR controlled)
+        # 3a. Quantitative DiD: Welch's one-sided t-test on paired log2 differences (BH-FDR controlled)
         g_d = gald_diffs[i, ~np.isnan(gald_diffs[i])] if gald_diffs.shape[1] > 0 else np.array([])
         ng_d = nongald_diffs[i, ~np.isnan(nongald_diffs[i])] if nongald_diffs.shape[1] > 0 else np.array([])
 
@@ -949,7 +976,7 @@ def analyze_background_ttest(
                 _, p_did = ttest_ind(g_d, ng_d, equal_var=False, alternative='greater')
                 did_quant_p[i] = p_did
 
-        # Presence/absence DiD: Fisher's exact test on Liver-only (Liver+ & LB-) pair counts (raw p; see DESIGN NOTE)
+        # 3b. Clean Liver-only presence DiD: one-sided Fisher on Liver-only (Liver+ & LB-) pair counts
         if n_gald > 0 and n_nongald > 0 and (g_lo_arr[i] > 0 or ng_lo_arr[i] > 0):
             _, p_pres = fisher_exact(
                 [[int(g_lo_arr[i]), int(n_gald - g_lo_arr[i])],
@@ -958,11 +985,23 @@ def analyze_background_ttest(
             )
             did_pres_p[i] = p_pres
 
+        # 3c. Carryover-aware DiD ("GALD Liver+LB vs. Non-GALD all-absent/sparse"):
+        # Compare GALD Liver-enriched pairs (Liver-only OR co-detected diff >= fc_thresh)
+        # conservatively against ALL Non-GALD Liver detections.
+        if n_gald > 0 and n_nongald > 0 and (g_enr_arr[i] > 0 or ng_ld_arr[i] > 0):
+            _, p_co = fisher_exact(
+                [[int(g_enr_arr[i]), int(n_gald - g_enr_arr[i])],
+                 [int(ng_ld_arr[i]), int(n_nongald - ng_ld_arr[i])]],
+                alternative='greater',
+            )
+            did_carryover_p[i] = p_co
+
     did_df = pd.DataFrame({
         'did_fc': did_fc,
         'did_quant_p': did_quant_p,
         'did_quant_fdr': np.nan,
         'did_pres_p': did_pres_p,
+        'did_carryover_p': did_carryover_p,
     }, index=idx)
 
     valid_dq = did_df['did_quant_p'].dropna()
@@ -981,6 +1020,13 @@ def analyze_background_ttest(
         & (did_df['did_pres_p'] < p_thresh)
         & ((g_lo_arr / max(n_gald, 1)) > (ng_lo_arr / max(n_nongald, 1)))
     )
+    did_df['sig_did_carryover'] = (
+        gald_res['sig_quant']
+        & ~(nongald_res['sig_quant'] | nongald_res['sig_absent_lb'])
+        & did_df['did_carryover_p'].notna()
+        & (did_df['did_carryover_p'] < p_thresh)
+        & ((g_enr_arr / max(n_gald, 1)) > (ng_ld_arr / max(n_nongald, 1)))
+    )
 
     classifications = {}
     records = []
@@ -992,11 +1038,13 @@ def analyze_background_ttest(
 
         gald_sig_up = bool(g['sig_absent_lb'] or g['sig_quant'])
         nongald_sig_up = bool(ng['sig_absent_lb'] or ng['sig_quant'])
-        gald_gt_ctrl = bool(d['sig_did_quant'] or d['sig_did_pres'])
+        gald_gt_ctrl = bool(d['sig_did_quant'] or d['sig_did_pres'] or d['sig_did_carryover'])
 
         if gald_sig_up and gald_gt_ctrl:
             if bool(g['sig_absent_lb']) and bool(d['sig_did_pres']) and not bool(d['sig_did_quant']):
                 cat = "GALD-Enriched Over LB & Controls (Absent in LB)"
+            elif bool(d['sig_did_carryover']) and not bool(d['sig_did_quant']) and not bool(d['sig_did_pres']):
+                cat = "GALD-Enriched Over LB & Controls (Trace LB Carryover)"
             else:
                 cat = "GALD-Enriched Over LB & Controls"
         elif gald_sig_up and nongald_sig_up:
@@ -1027,21 +1075,26 @@ def analyze_background_ttest(
             'DiD_Quant_p': d['did_quant_p'],
             'DiD_Quant_FDR': d['did_quant_fdr'],
             'DiD_Pres_Fisher_p': d['did_pres_p'],
+            'DiD_Carryover_Fisher_p': d['did_carryover_p'],
             'GALD_Liver_Det': int(g['liver_det']),
             'GALD_LB_Det': int(g['lb_det']),
             'GALD_LiverOnly_Pairs': int(g['liver_only']),
+            'GALD_LBOnly_Pairs': int(g['lb_only']),
             'GALD_Both_Pairs_Tested': int(g['both_tested']),
+            'GALD_Enriched_Pairs': int(g['enriched_pairs']),
             'GALD_Pairs_Total': n_gald,
-            'GALD_Fisher_p': g['fisher_p'],
+            'GALD_McNemar_p': g['mcnemar_p'],
             'GALD_Log2FC_Liver_vs_LB': g['mean_fc'],
             'GALD_p_value': g['quant_p'],
             'GALD_FDR': g['quant_fdr'],
             'NonGALD_Liver_Det': int(ng['liver_det']),
             'NonGALD_LB_Det': int(ng['lb_det']),
             'NonGALD_LiverOnly_Pairs': int(ng['liver_only']),
+            'NonGALD_LBOnly_Pairs': int(ng['lb_only']),
             'NonGALD_Both_Pairs_Tested': int(ng['both_tested']),
+            'NonGALD_Enriched_Pairs': int(ng['enriched_pairs']),
             'NonGALD_Pairs_Total': n_nongald,
-            'NonGALD_Fisher_p': ng['fisher_p'],
+            'NonGALD_McNemar_p': ng['mcnemar_p'],
             'NonGALD_Log2FC_Liver_vs_LB': ng['mean_fc'],
             'NonGALD_p_value': ng['quant_p'],
             'NonGALD_FDR': ng['quant_fdr'],
@@ -1049,14 +1102,20 @@ def analyze_background_ttest(
 
     if records and out_dir is not None:
         bg_df = pd.DataFrame(records).sort_values(
-            by=['Category', 'DiD_Quant_FDR', 'DiD_Pres_Fisher_p', 'GALD_FDR', 'GALD_Fisher_p'],
+            by=[
+                'Category', 'DiD_Quant_FDR', 'DiD_Pres_Fisher_p',
+                'DiD_Carryover_Fisher_p', 'GALD_FDR', 'GALD_McNemar_p'
+            ],
             na_position='last',
         )
         out_path = Path(out_dir) / f"{engine_name}_Background_LB_vs_Liver_Separated.tsv"
         bg_df.to_csv(out_path, sep='\t', index=False)
 
         counts = bg_df['Category'].value_counts().to_dict()
-        print(f"    [{engine_name} Paired LB vs Liver (GALD n={n_gald}, Non-GALD n={n_nongald})]")
+        print(
+            f"    [{engine_name} Paired LB vs Liver | Pairing={pairing_desc} | "
+            f"GALD n={n_gald}, Non-GALD n={n_nongald}]"
+        )
         for k_cat, v_cnt in counts.items():
             print(f"      - {k_cat}: {v_cnt}")
 
@@ -1066,15 +1125,17 @@ def analyze_background_ttest(
                 print(
                     f"      * Target {hl}: {classifications[hl]} "
                     f"(DiD FC={row_hl['DiD_Log2FC_GALD_vs_NonGALD']:.2f}, "
-                    f"DiD_Q_FDR={row_hl['DiD_Quant_FDR']:.3g}, DiD_P_p={row_hl['DiD_Pres_Fisher_p']:.3g} | "
-                    f"GALD Liver/LB={row_hl['GALD_Liver_Det']}/{row_hl['GALD_LB_Det']}, "
-                    f"Fisher_p={row_hl['GALD_Fisher_p']:.3g}, FC={row_hl['GALD_Log2FC_Liver_vs_LB']:.2f}, FDR={row_hl['GALD_FDR']:.3g} | "
-                    f"Non-GALD Liver/LB={row_hl['NonGALD_Liver_Det']}/{row_hl['NonGALD_LB_Det']}, "
-                    f"Fisher_p={row_hl['NonGALD_Fisher_p']:.3g}, FC={row_hl['NonGALD_Log2FC_Liver_vs_LB']:.2f}, FDR={row_hl['NonGALD_FDR']:.3g})"
+                    f"DiD_Q_FDR={row_hl['DiD_Quant_FDR']:.3g}, DiD_P_p={row_hl['DiD_Pres_Fisher_p']:.3g}, "
+                    f"DiD_CO_p={row_hl['DiD_Carryover_Fisher_p']:.3g} | "
+                    f"GALD Liver/LB={row_hl['GALD_Liver_Det']}/{row_hl['GALD_LB_Det']} "
+                    f"[LO={row_hl['GALD_LiverOnly_Pairs']}, BO={row_hl['GALD_LBOnly_Pairs']}, Enr={row_hl['GALD_Enriched_Pairs']}], "
+                    f"McNemar_p={row_hl['GALD_McNemar_p']:.3g}, FC={row_hl['GALD_Log2FC_Liver_vs_LB']:.2f}, FDR={row_hl['GALD_FDR']:.3g} | "
+                    f"Non-GALD Liver/LB={row_hl['NonGALD_Liver_Det']}/{row_hl['NonGALD_LB_Det']} "
+                    f"[LO={row_hl['NonGALD_LiverOnly_Pairs']}, BO={row_hl['NonGALD_LBOnly_Pairs']}], "
+                    f"McNemar_p={row_hl['NonGALD_McNemar_p']:.3g}, FC={row_hl['NonGALD_Log2FC_Liver_vs_LB']:.2f}, FDR={row_hl['NonGALD_FDR']:.3g})"
                 )
 
     return classifications
-
 
 # ==========================================
 # 7. SORTING, EXPORT, AND CROSS-ENGINE SUMMARY HELPERS

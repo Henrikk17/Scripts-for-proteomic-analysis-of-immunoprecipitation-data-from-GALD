@@ -1,4 +1,4 @@
-# 12/11-2026
+# 12/11-2026 (Updated: preserve Subject_ID from annotation table; LFQ-only)
 # HPC-Ready Function for loading MaxQuant output data
 
 import re
@@ -17,7 +17,6 @@ def find_maxquant_txt_dir(run_id_num, base_dir="~/DTU-GALD"):
     padded_id = f"R{int(str(run_id_num).lstrip('R')):04d}"   # e.g. R0876, R1101, R1344
     unpadded_id = f"R{int(str(run_id_num).lstrip('R'))}"     # e.g. R876
 
-    # Check candidate root folders (e.g., unzipped_R0876, unzipped_R876, R0876)
     candidates = (
         list(base_path.glob(f"*{padded_id}*")) +
         list(base_path.glob(f"*{unpadded_id}*"))
@@ -32,6 +31,7 @@ def find_maxquant_txt_dir(run_id_num, base_dir="~/DTU-GALD"):
     raise FileNotFoundError(
         f"❌ Could not find 'proteinGroups.txt' for {padded_id} inside {base_path}"
     )
+
 
 def _extract_sample_id(col_or_series):
     """
@@ -55,16 +55,43 @@ def _extract_sample_id(col_or_series):
     return _parse_one(col_or_series)
 
 
+def _extract_subject_map(annot_df, annot_label):
+    """Detect and standardize a subject/donor ID column from the annotation table."""
+    col_lookup = {c.strip().lower(): c for c in annot_df.columns}
+    candidates = ['subject_id', 'donor_id', 'pair_id', 'subject', 'donor', 'patient_id', 'individual']
+    matched_col = next((col_lookup[k] for k in candidates if k in col_lookup), None)
+
+    if matched_col is None:
+        print(
+            f"⚠️ Warning: No Subject_ID/Donor_ID column found in {annot_label} "
+            f"(columns: {list(annot_df.columns)}). Background pairing will fall back to sample-number offset."
+        )
+        return None
+
+    cleaned_subj = (
+        annot_df[matched_col]
+        .astype(str)
+        .str.strip()
+        .replace({'': np.nan, 'nan': np.nan, 'None': np.nan, 'none': np.nan, 'NA': np.nan, 'na': np.nan})
+    )
+    sample_to_subject = dict(zip(annot_df['sample'].astype(str).str.strip(), cleaned_subj))
+    n_valid = int(cleaned_subj.notna().sum())
+    print(f"Mapped Subject_ID from annotation column '{matched_col}' ({n_valid}/{len(annot_df)} samples annotated).")
+    return sample_to_subject
+
+
 def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
     """
     Loads MaxQuant proteinGroups.txt (and optionally peptides.txt) on the HPC.
     ROOT can be the path to the 'txt' folder (supports '~') or auto-discovered.
+    Preserves Subject_ID from the annotation table.
     """
     annot_path = Path(annotation_file).expanduser().resolve()
     annot_df = pd.read_csv(annot_path, sep='\t')
 
     sample_to_group = dict(zip(annot_df['sample'].astype(str).str.strip(), annot_df['condition'].astype(str).str.strip()))
     sample_to_type = dict(zip(annot_df['sample'].astype(str).str.strip(), annot_df['sample_type'].astype(str).str.strip()))
+    sample_to_subject = _extract_subject_map(annot_df, annot_path.name)
 
     print(f"Loaded annotations: Found {len(sample_to_group)} total samples in {annot_path.name}.")
 
@@ -75,7 +102,6 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
     if root_path.name == "proteinGroups.txt":
         root_path = root_path.parent
     elif not (root_path / "proteinGroups.txt").exists():
-        # If user passed a parent directory (e.g., ~/DTU-GALD/unzipped_R0876), search inside it
         found = list(root_path.rglob("proteinGroups.txt"))
         if found:
             root_path = found[0].parent
@@ -111,8 +137,7 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
         'Protein names': 'Protein Name'
     }, inplace=True, errors='ignore')
 
-
-# Clean multi-mapped MaxQuant gene names (e.g., "TAGLN2;TAGLN" -> "TAGLN2")
+    # Clean multi-mapped MaxQuant gene names (e.g., "TAGLN2;TAGLN" -> "TAGLN2")
     if 'Gene' in prot_df.columns:
         prot_df['Gene'] = (
             prot_df['Gene']
@@ -123,12 +148,10 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
             .replace({'nan': np.nan, 'None': np.nan, '': np.nan})
         )
 
-    # ---> INJECTED PEPTIDE EXTRACTION <---
     # Prioritize scalar peptide count columns over semicolon-delimited protein-group counts
     target_pep_cols = ['Razor + unique peptides', 'Peptides', 'Peptide counts (razor+unique)']
     pep_cols = [c for c in target_pep_cols if c in prot_df.columns]
 
-    # Fallback if exact names aren't found
     if not pep_cols:
         pep_cols = [
             c for c in prot_df.columns
@@ -137,7 +160,6 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
 
     if pep_cols:
         pep_col = pep_cols[0]
-        # Handle semicolon-delimited values (e.g. "12;12;5") safely before numeric conversion
         prot_df[pep_col] = pd.to_numeric(
             prot_df[pep_col].astype(str).str.split(';').str[0].str.strip(),
             errors='coerce'
@@ -151,7 +173,6 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
             'Protein', 'Protein Group', 'Gene', 'Description',
             'Protein Name', 'Score', 'Q-value'
         ]
-    # -------------------------------------
 
     # --- Dynamically grab MaxQuant LFQ Columns ---
     lfq_cols_prot = [c for c in prot_df.columns if c.startswith('LFQ intensity ')]
@@ -176,6 +197,10 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
     melted_prot['Sample'] = _extract_sample_id(melted_prot['Sample_Col'])
     melted_prot['Group'] = melted_prot['Sample'].map(sample_to_group)
     melted_prot['Sample_type'] = melted_prot['Sample'].map(sample_to_type)
+    melted_prot['Subject_ID'] = (
+        melted_prot['Sample'].map(sample_to_subject)
+        if sample_to_subject is not None else np.nan
+    )
 
     # --- SANITY CHECK ---
     unique_mapped_samples_prot = melted_prot['Sample'].unique()
@@ -194,11 +219,9 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
     # ==========================================
     # 3. LOAD & MELT PEPTIDE DATA (OPTIONAL)
     # ==========================================
-
     if not load_peptides:
         return master_prot_df, None
 
-    # Fast bypass if peptides.txt is missing
     if not pep_file.exists():
         print(f"🚨 Warning: {pep_file.name} not found in {root_path}! Bypassing peptide loading for this dataset.")
         return master_prot_df, None
@@ -248,6 +271,10 @@ def load_maxQuant_proteomic_data(ROOT, annotation_file, load_peptides=True):
     melted_pep['Sample'] = _extract_sample_id(melted_pep['Sample_Col'])
     melted_pep['Group'] = melted_pep['Sample'].map(sample_to_group)
     melted_pep['Sample_type'] = melted_pep['Sample'].map(sample_to_type)
+    melted_pep['Subject_ID'] = (
+        melted_pep['Sample'].map(sample_to_subject)
+        if sample_to_subject is not None else np.nan
+    )
 
     melted_pep['Razor Intensity'] = pd.to_numeric(melted_pep['Razor Intensity'], errors='coerce')
     master_pep_df = melted_pep[(melted_pep['Razor Intensity'].notna()) &
